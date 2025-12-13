@@ -1,0 +1,112 @@
+# Conda environment for 3D Medical Image Analysis Pipeline
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate medical-imaging
+#
+# For GPU support, this uses PyTorch with CUDA from the pytorch channel.
+# The cudatoolkit is bundled - no system CUDA installation required.
+#
+# To update after changes:
+#   conda env update -f environment.yml --prune
+#
+# To create a lockfile for reproducibility:
+#   conda-lock -f environment.yml -p linux-64
+#
+
+name: medical-imaging
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python=3.10
+
+  # =========================================================================
+  # PyTorch with CUDA (bundled cudatoolkit - no system CUDA needed)
+  # =========================================================================
+  - pytorch>=2.1.0
+  - torchvision>=0.16.0
+  - torchaudio>=2.1.0
+  - pytorch-cuda=12.1
+
+  # =========================================================================
+  # Native libraries (conda handles these cleanly)
+  # =========================================================================
+  - libgl                    # OpenGL (replaces libgl1-mesa-glx)
+  - glib                     # GLib (replaces libglib2.0-0)
+  - xorg-libsm               # X11 SM (replaces libsm6)
+  - xorg-libxext             # X11 Xext (replaces libxext6)
+  - xorg-libxrender          # X11 Xrender (replaces libxrender-dev)
+
+  # =========================================================================
+  # Build tools
+  # =========================================================================
+  - git
+  - git-lfs
+  - wget
+  - curl
+  - unzip
+
+  # =========================================================================
+  # Core ML and Transformers
+  # =========================================================================
+  - transformers>=4.40.0
+  - accelerate>=0.30.0
+  - sentencepiece
+  - protobuf
+  - huggingface_hub
+  - safetensors
+
+  # =========================================================================
+  # Medical Imaging
+  # =========================================================================
+  - simpleitk>=2.3.0
+  - pydicom>=2.4.0
+  - nibabel>=5.2.0
+  # Note: monai installed via pip for latest version
+
+  # =========================================================================
+  # Scientific Computing
+  # =========================================================================
+  - numpy>=1.26.0
+  - scipy>=1.12.0
+  - pillow
+
+  # =========================================================================
+  # Utilities
+  # =========================================================================
+  - tqdm
+  - requests
+  - python-dotenv
+  - matplotlib
+
+  # =========================================================================
+  # VILA-M3 dependencies
+  # =========================================================================
+  - einops
+  - timm
+
+  # =========================================================================
+  # Pip-only packages (not well-supported in conda or need latest versions)
+  # =========================================================================
+  - pip
+  - pip:
+    # MONAI - latest version with all features
+    - monai[all]>=1.3.0
+
+    # Gradio - web UI for VILA-M3
+    - gradio>=4.0.0
+
+# =========================================================================
+# Environment variables (set when environment is activated)
+# =========================================================================
+variables:
+  # Reduce memory fragmentation
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # Disable tokenizers parallelism warning
+  TOKENIZERS_PARALLELISM: "false"

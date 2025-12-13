@@ -1,0 +1,461 @@
+"""
+Download Model Weights
+
+Downloads model weights for supported 3D medical image models from Hugging Face.
+Supports: M3D-LaMed, Med3DVLM, RadFM, CT-CLIP
+"""
+
+import argparse
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download, hf_hub_download
+
+
+# Default paths
+DEFAULT_MODEL_DIR = Path(__file__).parent.parent / "models"
+
+# Model configurations
+MODEL_CONFIGS = {
+    "m3d-lamed": {
+        "repo_id": "GoodBaiBai88/M3D-LaMed-Phi-3-4B",
+        "local_dir": "M3D-LaMed-Phi-3-4B",
+        "ignore_patterns": ["model.bin"],  # Skip legacy format, use SafeTensors
+        "description": "M3D-LaMed-Phi-3-4B (VQA, ~16GB)",
+        "extra_files": {
+            "vit": {
+                "repo_id": "GoodBaiBai88/M3D-CLIP",
+                "filename": "pretrained_ViT.bin",
+                "description": "Vision encoder weights",
+            }
+        }
+    },
+    "med3dvlm": {
+        "repo_id": "MagicXin/Med3DVLM-Qwen-2.5-7B",
+        "local_dir": "Med3DVLM",
+        "ignore_patterns": [],
+        "description": "Med3DVLM-Qwen-2.5-7B (VQA, ~33GB)",
+    },
+    "radfm": {
+        "repo_id": "chaoyi-wu/RadFM",
+        "local_dir": "RadFM",
+        "ignore_patterns": [],
+        "description": "RadFM (VQA, LLaMA base, ~100GB as zip archives)",
+        "archives": [
+            {"name": "RadFM.zip", "is_split": True},  # Split archive (z01-z04 + .zip)
+            {"name": "pytorch_model.zip", "is_split": False},  # Single archive
+        ],
+        "extract_required": True,
+    },
+    "ct-clip": {
+        "repo_id": "ibrahimethemhamamci/CT-CLIP",  # May need to be updated
+        "local_dir": "CT-CLIP",
+        "ignore_patterns": [],
+        "description": "CT-CLIP (Classifier, 18 pathologies)",
+        "note": "Check https://github.com/ibrahimethemhamamci/CT-CLIP for model availability"
+    },
+    "vila-m3-3b": {
+        "repo_id": "MONAI/Llama3-VILA-M3-3B",
+        "local_dir": "VILA-M3-3B",
+        "ignore_patterns": [],
+        "description": "VILA-M3-3B (VQA + Experts, MONAI, ~6GB)",
+        "conv_mode": "vicuna_v1",
+        "note": "Requires external/vila-m3 framework. Use conv_mode=vicuna_v1",
+    },
+    "vila-m3-8b": {
+        "repo_id": "MONAI/Llama3-VILA-M3-8B",
+        "local_dir": "VILA-M3-8B",
+        "ignore_patterns": [],
+        "description": "VILA-M3-8B (VQA + Experts, MONAI, ~18GB VRAM)",
+        "conv_mode": "llama_3",
+        "note": "Requires external/vila-m3 framework. Use conv_mode=llama_3",
+    },
+    "vila-m3-13b": {
+        "repo_id": "MONAI/Llama3-VILA-M3-13B",
+        "local_dir": "VILA-M3-13B",
+        "ignore_patterns": [],
+        "description": "VILA-M3-13B (VQA + Experts, MONAI, ~30GB VRAM)",
+        "conv_mode": "vicuna_v1",
+        "note": "Requires external/vila-m3 framework. Use conv_mode=vicuna_v1",
+    },
+}
+
+
+def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
+    """
+    Extract RadFM zip archives on Linux/macOS.
+
+    RadFM is distributed as:
+    - RadFM.zip (split archive with .z01, .z02, .z03, .z04 parts)
+    - pytorch_model.zip (single archive)
+
+    Args:
+        target_dir: Directory containing the downloaded archives
+        cleanup: Remove zip files after successful extraction
+
+    Returns:
+        True if extraction successful
+    """
+    system = platform.system().lower()
+
+    if system == "windows":
+        print("  Automatic extraction not supported on Windows.")
+        print("  Please extract manually using 7-Zip or similar:")
+        print(f"    1. Extract RadFM.zip (will use .z01-.z04 parts)")
+        print(f"    2. Extract pytorch_model.zip")
+        return False
+
+    # Check for unzip command
+    if not shutil.which("unzip"):
+        print("  Error: 'unzip' command not found. Install with:")
+        print("    Ubuntu/Debian: sudo apt-get install unzip")
+        print("    macOS: brew install unzip")
+        return False
+
+    success = True
+    archives = [
+        ("RadFM.zip", True),       # Split archive
+        ("pytorch_model.zip", False),  # Single archive
+    ]
+
+    for archive_name, is_split in archives:
+        archive_path = target_dir / archive_name
+
+        if not archive_path.exists():
+            print(f"  Warning: {archive_name} not found, skipping...")
+            continue
+
+        print(f"  Extracting {archive_name}...")
+
+        try:
+            # For split archives, unzip will automatically find .z01, .z02, etc.
+            result = subprocess.run(
+                ["unzip", "-o", "-q", str(archive_path), "-d", str(target_dir)],
+                capture_output=True,
+                text=True,
+                cwd=str(target_dir),
+            )
+
+            if result.returncode != 0:
+                print(f"    Error extracting {archive_name}:")
+                print(f"    {result.stderr}")
+                success = False
+                continue
+
+            print(f"    Extracted {archive_name} successfully")
+
+            # Cleanup zip files if requested
+            if cleanup:
+                archive_path.unlink()
+                if is_split:
+                    # Remove split parts
+                    for part in target_dir.glob(f"{archive_name.replace('.zip', '')}.z*"):
+                        part.unlink()
+                print(f"    Cleaned up archive files")
+
+        except Exception as e:
+            print(f"    Error: {e}")
+            success = False
+
+    return success
+
+
+def download_model(
+    model_name: str,
+    model_dir: Path,
+    resume: bool = True,
+    auto_extract: bool = True,
+    cleanup_archives: bool = True,
+) -> bool:
+    """
+    Download a specific model.
+
+    Args:
+        model_name: Name of the model to download
+        model_dir: Directory to save model
+        resume: Enable resume download
+        auto_extract: Automatically extract archives (RadFM)
+        cleanup_archives: Remove archive files after extraction
+
+    Returns:
+        True if successful
+    """
+    if model_name not in MODEL_CONFIGS:
+        print(f"Error: Unknown model '{model_name}'")
+        print(f"Available models: {', '.join(MODEL_CONFIGS.keys())}")
+        return False
+
+    config = MODEL_CONFIGS[model_name]
+    target_dir = model_dir / config["local_dir"]
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Downloading {model_name}...")
+    print(f"  Repository: {config['repo_id']}")
+    print(f"  Target: {target_dir}")
+    if config.get("note"):
+        print(f"  Note: {config['note']}")
+    print()
+
+    try:
+        snapshot_download(
+            repo_id=config["repo_id"],
+            local_dir=str(target_dir),
+            ignore_patterns=config.get("ignore_patterns", []),
+        )
+
+        # Verify download
+        config_path = target_dir / "config.json"
+        if config_path.exists():
+            print(f"  Download complete! config.json found")
+        else:
+            # Some models may not have config.json
+            if list(target_dir.iterdir()):
+                print(f"  Download complete! Files present in {target_dir}")
+            else:
+                print("  Warning: Download completed but directory is empty!")
+                return False
+
+        # Download extra files if any
+        if "extra_files" in config:
+            for name, extra in config["extra_files"].items():
+                print(f"\n  Downloading extra: {extra['description']}...")
+                hf_hub_download(
+                    repo_id=extra["repo_id"],
+                    filename=extra["filename"],
+                    local_dir=str(model_dir),
+                )
+                print(f"    Downloaded {extra['filename']}")
+
+        # Handle extraction for RadFM
+        if config.get("extract_required"):
+            print()
+            if auto_extract:
+                print("  Attempting automatic extraction...")
+                if model_name == "radfm":
+                    extract_success = extract_radfm_archives(target_dir, cleanup=cleanup_archives)
+                    if not extract_success:
+                        print()
+                        print("  " + "=" * 50)
+                        print("  MANUAL EXTRACTION REQUIRED")
+                        print("  " + "=" * 50)
+                        print(f"  Navigate to: {target_dir}")
+                        print("  Run: unzip RadFM.zip && unzip pytorch_model.zip")
+                        print()
+            else:
+                print("  " + "=" * 50)
+                print("  EXTRACTION REQUIRED (--no-extract specified)")
+                print("  " + "=" * 50)
+                print(f"  Navigate to: {target_dir}")
+                print("  Run: unzip RadFM.zip && unzip pytorch_model.zip")
+                print()
+
+        return True
+
+    except Exception as e:
+        print(f"  Error downloading: {e}")
+        if "401" in str(e) or "404" in str(e):
+            print(f"\n  The model may not be publicly available on Hugging Face.")
+            print(f"  Check the model's repository for download instructions:")
+            if config.get("note"):
+                print(f"    {config['note']}")
+        return False
+
+
+def verify_model(model_name: str, model_dir: Path) -> dict:
+    """
+    Verify a model download.
+
+    Args:
+        model_name: Name of the model
+        model_dir: Model directory
+
+    Returns:
+        Dictionary with verification results
+    """
+    if model_name not in MODEL_CONFIGS:
+        return {"exists": False, "error": f"Unknown model: {model_name}"}
+
+    config = MODEL_CONFIGS[model_name]
+    target_dir = model_dir / config["local_dir"]
+
+    results = {
+        "exists": target_dir.exists(),
+        "has_config": (target_dir / "config.json").exists() if target_dir.exists() else False,
+        "size_gb": 0,
+        "file_count": 0,
+    }
+
+    if target_dir.exists():
+        files = list(target_dir.rglob("*"))
+        results["file_count"] = len([f for f in files if f.is_file()])
+        results["size_gb"] = sum(
+            f.stat().st_size for f in files if f.is_file()
+        ) / (1024**3)
+
+    return results
+
+
+def list_models():
+    """Print information about available models."""
+    print("Available Models:")
+    print("-" * 60)
+    for name, config in MODEL_CONFIGS.items():
+        print(f"\n  {name}:")
+        print(f"    {config['description']}")
+        print(f"    HuggingFace: {config['repo_id']}")
+        if config.get("note"):
+            print(f"    Note: {config['note']}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download model weights for 3D medical image analysis"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="m3d-lamed",
+        help=f"Model to download (default: m3d-lamed). Options: {', '.join(MODEL_CONFIGS.keys())}"
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Download all available models"
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default=str(DEFAULT_MODEL_DIR),
+        help=f"Directory to save models (default: {DEFAULT_MODEL_DIR})"
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List available models and exit"
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify existing downloads"
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable download resume (start fresh)"
+    )
+    parser.add_argument(
+        "--no-extract",
+        action="store_true",
+        help="Skip automatic archive extraction (RadFM)"
+    )
+    parser.add_argument(
+        "--keep-archives",
+        action="store_true",
+        help="Keep archive files after extraction (default: delete)"
+    )
+    parser.add_argument(
+        "--extract-only",
+        action="store_true",
+        help="Only extract archives (skip download, for RadFM)"
+    )
+
+    args = parser.parse_args()
+    model_dir = Path(args.model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("3D Medical Model Downloader")
+    print("=" * 60)
+    print()
+
+    # List mode
+    if args.list:
+        list_models()
+        return 0
+
+    # Verify mode
+    if args.verify:
+        print("Verifying model downloads...")
+        print()
+        for name in MODEL_CONFIGS:
+            results = verify_model(name, model_dir)
+            status = "OK" if results["exists"] and (results["has_config"] or results["file_count"] > 0) else "MISSING"
+            print(f"  {name}: {status}")
+            if results["exists"]:
+                print(f"    Files: {results['file_count']}, Size: {results['size_gb']:.2f} GB")
+        return 0
+
+    # Extract-only mode (for RadFM when archives already downloaded)
+    if args.extract_only:
+        model_name = args.model.lower()
+        if model_name != "radfm":
+            print(f"Error: --extract-only only applies to radfm model")
+            return 1
+
+        config = MODEL_CONFIGS[model_name]
+        target_dir = model_dir / config["local_dir"]
+
+        if not target_dir.exists():
+            print(f"Error: {target_dir} does not exist. Run download first.")
+            return 1
+
+        print(f"Extracting RadFM archives in {target_dir}...")
+        cleanup = not args.keep_archives
+        if extract_radfm_archives(target_dir, cleanup=cleanup):
+            print("Extraction complete!")
+            return 0
+        else:
+            print("Extraction failed or requires manual intervention.")
+            return 1
+
+    # Determine models to download
+    if args.all:
+        models_to_download = list(MODEL_CONFIGS.keys())
+    else:
+        models_to_download = [args.model.lower()]
+
+    # Validate model names
+    for name in models_to_download:
+        if name not in MODEL_CONFIGS:
+            print(f"Error: Unknown model '{name}'")
+            list_models()
+            return 1
+
+    # Download models
+    resume = not args.no_resume
+    auto_extract = not args.no_extract
+    cleanup_archives = not args.keep_archives
+    success_count = 0
+    fail_count = 0
+
+    for model_name in models_to_download:
+        print("-" * 60)
+        if download_model(model_name, model_dir, resume, auto_extract, cleanup_archives):
+            success_count += 1
+        else:
+            fail_count += 1
+        print()
+
+    # Summary
+    print("=" * 60)
+    print("Download Summary")
+    print("=" * 60)
+    print(f"  Successful: {success_count}")
+    print(f"  Failed: {fail_count}")
+    print()
+
+    if fail_count == 0:
+        print("All downloads completed successfully!")
+        return 0
+    else:
+        print("Some downloads failed. Check errors above.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
