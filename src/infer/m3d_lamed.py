@@ -127,16 +127,23 @@ class M3DLaMedModel(Medical3DModel):
 
         return torch.from_numpy(volume).to(dtype=self.dtype, device=self.device)
 
-    def load_model(self) -> None:
-        """Load M3D-LaMed model and tokenizer."""
+    def load_model(self, local_files_only: bool = True) -> None:
+        """
+        Load M3D-LaMed model and tokenizer.
+
+        Args:
+            local_files_only: If True, only use local files (don't download from HF).
+                              Set to True to prevent overwriting fine-tuned models.
+        """
         if self._loaded:
             return
 
         print(f"Loading tokenizer from {self.model_path}...")
+        print(f"  local_files_only: {local_files_only}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(self.model_path),
             trust_remote_code=True,
-            local_files_only=True,
+            local_files_only=local_files_only,
         )
 
         print(f"Loading M3D-LaMed model from {self.model_path}...")
@@ -149,7 +156,7 @@ class M3DLaMedModel(Medical3DModel):
             torch_dtype=self.dtype,
             device_map="auto",
             trust_remote_code=True,
-            local_files_only=True,
+            local_files_only=local_files_only,
             attn_implementation="eager",
         )
 

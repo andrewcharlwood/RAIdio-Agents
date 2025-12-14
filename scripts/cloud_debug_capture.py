@@ -61,6 +61,7 @@ def capture_m3d_lamed_debug(
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path),
             trust_remote_code=True,
+            local_files_only=True,  # Prevent overwriting fine-tuned model files
         )
 
         # Constants
@@ -128,6 +129,7 @@ def capture_m3d_lamed_debug(
             torch_dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True,
+            local_files_only=True,  # Prevent overwriting fine-tuned model files
             attn_implementation="eager",
         )
         model.eval()
@@ -136,9 +138,54 @@ def capture_m3d_lamed_debug(
         if use_synthetic or dicom_path is None:
             print("Using synthetic test volume...")
             image_tensor = torch.randn(1, 1, 32, 256, 256, dtype=torch.float16, device="cuda")
+            result["debug_data"]["preprocessing"] = {"synthetic": True}
         else:
-            from src.preprocessing import preprocess_for_m3d
+            import SimpleITK as sitk
             print(f"Loading DICOM from {dicom_path}...")
+
+            # First, capture raw DICOM info BEFORE preprocessing
+            try:
+                reader = sitk.ImageSeriesReader()
+                dicom_files = reader.GetGDCMSeriesFileNames(dicom_path)
+
+                if dicom_files:
+                    # Read just the first file to get metadata
+                    first_file = sitk.ReadImage(dicom_files[0])
+
+                    # Try to get raw pixel stats before windowing
+                    reader.SetFileNames(dicom_files)
+                    raw_image = reader.Execute()
+                    raw_array = sitk.GetArrayFromImage(raw_image)
+
+                    result["debug_data"]["preprocessing"] = {
+                        "dicom_file_count": len(dicom_files),
+                        "raw_image_size": list(raw_image.GetSize()),  # (X, Y, Z)
+                        "raw_image_spacing": list(raw_image.GetSpacing()),
+                        "raw_pixel_type": str(raw_image.GetPixelIDTypeAsString()),
+                        "raw_min_value": float(raw_array.min()),
+                        "raw_max_value": float(raw_array.max()),
+                        "raw_mean_value": float(raw_array.mean()),
+                        "raw_std_value": float(raw_array.std()),
+                        "series_description": first_file.GetMetaData("0008|103e") if first_file.HasMetaDataKey("0008|103e") else "unknown",
+                        "modality_tag": first_file.GetMetaData("0008|0060") if first_file.HasMetaDataKey("0008|0060") else "unknown",
+                        "is_likely_scout": (
+                            raw_array.shape[0] <= 3 or  # Very few slices
+                            "topo" in str(first_file.GetMetaData("0008|103e") if first_file.HasMetaDataKey("0008|103e") else "").lower() or
+                            "scout" in str(first_file.GetMetaData("0008|103e") if first_file.HasMetaDataKey("0008|103e") else "").lower() or
+                            "localizer" in str(first_file.GetMetaData("0008|103e") if first_file.HasMetaDataKey("0008|103e") else "").lower()
+                        ),
+                    }
+
+                    # Check if values look like HU (typically -1024 to +3000)
+                    if raw_array.min() >= 0 and raw_array.max() < 5000:
+                        result["debug_data"]["preprocessing"]["warning"] = (
+                            "Raw values may not be in Hounsfield Units! "
+                            f"Range [{raw_array.min()}, {raw_array.max()}] - expected negative values for CT."
+                        )
+            except Exception as e:
+                result["debug_data"]["preprocessing"] = {"error": str(e)}
+
+            from src.preprocessing import preprocess_for_m3d
             volume = preprocess_for_m3d(dicom_path, modality=modality)
             image_tensor = torch.from_numpy(volume).to(dtype=torch.float16, device="cuda")
             if image_tensor.ndim == 4:
@@ -153,6 +200,9 @@ def capture_m3d_lamed_debug(
             "min_value": float(image_tensor.min()),
             "max_value": float(image_tensor.max()),
             "mean_value": float(image_tensor.mean()),
+            "std_value": float(image_tensor.std()),
+            "is_constant": float(image_tensor.std()) < 0.001,
+            "value_range_ok": float(image_tensor.min()) >= 0 and float(image_tensor.max()) <= 1 and float(image_tensor.std()) > 0.01,
         }
 
         # Run generation
