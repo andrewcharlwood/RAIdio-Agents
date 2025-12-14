@@ -7,7 +7,7 @@
 # - M3D-LaMed (VQA, ~16GB)
 # - Med3DVLM (VQA, ~33GB)
 # - RadFM (VQA, ~100GB download, extracts to ~50GB)
-# - VILA-M3 (VQA + Experts, ~18GB for 8B)
+# - VILA-M3 (VQA + Experts, ~30GB for 13B)
 # - CT-CLIP (Classifier) - if available
 #
 # Prerequisites:
@@ -171,19 +171,71 @@ log_info "Models to download: ${MODELS_TO_DOWNLOAD}"
 check_conda || exit 1
 check_gpu || true
 
-# Estimate disk space needed
-DISK_NEEDED=50  # Base requirement (conda env + base packages)
+# Check if a model is already downloaded (has files in its directory)
+model_already_downloaded() {
+    local model_dir="$1"
+    if [ -d "$model_dir" ] && [ "$(ls -A "$model_dir" 2>/dev/null)" ]; then
+        return 0  # Already downloaded
+    fi
+    return 1  # Not downloaded
+}
+
+# Estimate disk space needed (only for models not already downloaded)
+DISK_NEEDED=0
+if [[ "$MODELS_TO_DOWNLOAD" == *"m3d-lamed"* ]] || [[ "$MODELS_TO_DOWNLOAD" == "all" ]]; then
+    if ! model_already_downloaded "${MODELS_DIR}/M3D-LaMed-Phi-3-4B"; then
+        DISK_NEEDED=$((DISK_NEEDED + 16))
+        log_info "m3d-lamed: ~16GB needed"
+    else
+        log_info "m3d-lamed: already downloaded, skipping space check"
+    fi
+fi
 if [[ "$MODELS_TO_DOWNLOAD" == *"radfm"* ]] || [[ "$MODELS_TO_DOWNLOAD" == "all" ]]; then
-    DISK_NEEDED=$((DISK_NEEDED + 150))  # RadFM needs ~150GB during extraction
+    if ! model_already_downloaded "${MODELS_DIR}/RadFM"; then
+        DISK_NEEDED=$((DISK_NEEDED + 150))  # RadFM needs ~150GB during extraction
+        log_info "radfm: ~150GB needed (during extraction)"
+    else
+        log_info "radfm: already downloaded, skipping space check"
+    fi
 fi
 if [[ "$MODELS_TO_DOWNLOAD" == *"med3dvlm"* ]] || [[ "$MODELS_TO_DOWNLOAD" == "all" ]]; then
-    DISK_NEEDED=$((DISK_NEEDED + 35))
+    if ! model_already_downloaded "${MODELS_DIR}/Med3DVLM"; then
+        DISK_NEEDED=$((DISK_NEEDED + 35))
+        log_info "med3dvlm: ~35GB needed"
+    else
+        log_info "med3dvlm: already downloaded, skipping space check"
+    fi
 fi
-if [[ "$MODELS_TO_DOWNLOAD" == *"vila-m3-13b"* ]]; then
-    DISK_NEEDED=$((DISK_NEEDED + 30))
+if [[ "$MODELS_TO_DOWNLOAD" == *"vila-m3-3b"* ]] || [[ "$MODELS_TO_DOWNLOAD" == "all" ]]; then
+    if ! model_already_downloaded "${MODELS_DIR}/VILA-M3-3B"; then
+        DISK_NEEDED=$((DISK_NEEDED + 6))
+        log_info "vila-m3-3b: ~6GB needed"
+    else
+        log_info "vila-m3-3b: already downloaded, skipping space check"
+    fi
+fi
+if [[ "$MODELS_TO_DOWNLOAD" == *"vila-m3-8b"* ]] || [[ "$MODELS_TO_DOWNLOAD" == "all" ]]; then
+    if ! model_already_downloaded "${MODELS_DIR}/VILA-M3-8B"; then
+        DISK_NEEDED=$((DISK_NEEDED + 18))
+        log_info "vila-m3-8b: ~18GB needed"
+    else
+        log_info "vila-m3-8b: already downloaded, skipping space check"
+    fi
+fi
+if [[ "$MODELS_TO_DOWNLOAD" == *"vila-m3-13b"* ]] || [[ "$MODELS_TO_DOWNLOAD" == "all" ]]; then
+    if ! model_already_downloaded "${MODELS_DIR}/VILA-M3-13B"; then
+        DISK_NEEDED=$((DISK_NEEDED + 30))
+        log_info "vila-m3-13b: ~30GB needed"
+    else
+        log_info "vila-m3-13b: already downloaded, skipping space check"
+    fi
 fi
 
-check_disk_space $DISK_NEEDED
+if [ "$DISK_NEEDED" -gt 0 ]; then
+    check_disk_space $DISK_NEEDED
+else
+    log_info "All requested models already downloaded, skipping disk space check"
+fi
 
 # ==============================================================================
 # Step 1: Initialize Conda
@@ -209,13 +261,40 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 1
 fi
 
-# Check if environment exists
-if conda env list | grep -q "^${ENV_NAME} "; then
-    log_info "Environment '${ENV_NAME}' exists, updating..."
-    conda env update -f "$ENV_FILE" --prune
+# Check if environment exists (check both env list and directory)
+ENV_PREFIX=$(conda info --base)/envs/${ENV_NAME}
+if [ -d "$HOME/.conda/envs/${ENV_NAME}" ]; then
+    ENV_PREFIX="$HOME/.conda/envs/${ENV_NAME}"
+fi
+
+# Track environment.yml changes using a hash file
+ENV_HASH_FILE="${PROJECT_ROOT}/.env_hash"
+CURRENT_HASH=$(md5sum "$ENV_FILE" | cut -d' ' -f1)
+STORED_HASH=""
+if [ -f "$ENV_HASH_FILE" ]; then
+    STORED_HASH=$(cat "$ENV_HASH_FILE")
+fi
+
+if conda env list | grep -E "^${ENV_NAME}\s+" > /dev/null 2>&1; then
+    # Environment exists - check if we need to update
+    if [ "$CURRENT_HASH" = "$STORED_HASH" ]; then
+        log_info "Environment '${ENV_NAME}' is up to date, skipping setup..."
+    else
+        log_info "Environment '${ENV_NAME}' exists but environment.yml changed, updating..."
+        conda env update -f "$ENV_FILE" --prune
+        echo "$CURRENT_HASH" > "$ENV_HASH_FILE"
+    fi
+elif [ -d "$ENV_PREFIX" ]; then
+    # Directory exists but env not registered - remove and recreate
+    log_warning "Found orphaned environment directory, removing..."
+    rm -rf "$ENV_PREFIX"
+    log_info "Creating new environment '${ENV_NAME}'..."
+    conda env create -f "$ENV_FILE"
+    echo "$CURRENT_HASH" > "$ENV_HASH_FILE"
 else
     log_info "Creating new environment '${ENV_NAME}'..."
     conda env create -f "$ENV_FILE"
+    echo "$CURRENT_HASH" > "$ENV_HASH_FILE"
 fi
 
 # Activate environment
@@ -281,7 +360,7 @@ if [ "$SKIP_MODELS" = false ]; then
     if [ "$MODELS_TO_DOWNLOAD" = "all" ]; then
         # Download all models (warning: this is ~200GB+)
         log_warning "Downloading ALL models. This will take significant time and disk space."
-        MODELS_LIST="m3d-lamed med3dvlm radfm vila-m3-8b"
+        MODELS_LIST="m3d-lamed med3dvlm radfm vila-m3-13b"
     else
         MODELS_LIST=$(echo "$MODELS_TO_DOWNLOAD" | tr ',' ' ')
     fi

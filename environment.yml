@@ -20,7 +20,7 @@ channels:
   - pytorch
   - nvidia
   - conda-forge
-  - defaults
+  # Note: defaults channel removed to avoid package conflicts (llvm-openmp vs intel-openmp)
 
 dependencies:
   # Python version
@@ -96,8 +96,8 @@ dependencies:
   # =========================================================================
   - pip
   - pip:
-    # MONAI - latest version with all features
-    - monai[all]>=1.3.0
+    # MONAI - core version (avoid [all] extras due to libitk/openjpeg conflict)
+    - monai>=1.3.0
 
     # Gradio - web UI for VILA-M3
     - gradio>=4.0.0
