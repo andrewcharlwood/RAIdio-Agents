@@ -43,10 +43,9 @@ MODEL_CONFIGS = {
     "radfm": {
         "repo_id": "chaoyi-wu/RadFM",
         "local_dir": "RadFM",
-        "ignore_patterns": [],
+        "ignore_patterns": ["RadFM.zip", "RadFM.z0*"],  # Skip split archive, use single zip only
         "description": "RadFM (VQA, LLaMA base, ~100GB as zip archives)",
         "archives": [
-            {"name": "RadFM.zip", "is_split": True},  # Split archive (z01-z04 + .zip)
             {"name": "pytorch_model.zip", "is_split": False},  # Single archive
         ],
         "extract_required": True,
@@ -87,15 +86,13 @@ MODEL_CONFIGS = {
 
 def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
     """
-    Extract RadFM zip archives on Linux/macOS.
+    Extract RadFM zip archive on Linux/macOS.
 
-    RadFM is distributed as:
-    - RadFM.zip (split archive with .z01, .z02, .z03, .z04 parts)
-    - pytorch_model.zip (single archive)
+    RadFM model weights are downloaded as pytorch_model.zip (single archive).
 
     Args:
-        target_dir: Directory containing the downloaded archives
-        cleanup: Remove zip files after successful extraction
+        target_dir: Directory containing the downloaded archive
+        cleanup: Remove zip file after successful extraction
 
     Returns:
         True if extraction successful
@@ -105,8 +102,7 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
     if system == "windows":
         print("  Automatic extraction not supported on Windows.")
         print("  Please extract manually using 7-Zip or similar:")
-        print(f"    1. Extract RadFM.zip (will use .z01-.z04 parts)")
-        print(f"    2. Extract pytorch_model.zip")
+        print(f"    Extract pytorch_model.zip")
         return False
 
     # Check for unzip command
@@ -118,7 +114,6 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
 
     success = True
     archives = [
-        ("RadFM.zip", True),       # Split archive
         ("pytorch_model.zip", False),  # Single archive
     ]
 
@@ -243,14 +238,14 @@ def download_model(
                         print("  MANUAL EXTRACTION REQUIRED")
                         print("  " + "=" * 50)
                         print(f"  Navigate to: {target_dir}")
-                        print("  Run: unzip RadFM.zip && unzip pytorch_model.zip")
+                        print("  Run: unzip pytorch_model.zip")
                         print()
             else:
                 print("  " + "=" * 50)
                 print("  EXTRACTION REQUIRED (--no-extract specified)")
                 print("  " + "=" * 50)
                 print(f"  Navigate to: {target_dir}")
-                print("  Run: unzip RadFM.zip && unzip pytorch_model.zip")
+                print("  Run: unzip pytorch_model.zip")
                 print()
 
         return True

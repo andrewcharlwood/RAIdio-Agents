@@ -26,6 +26,7 @@ DICOMDIR
 # Generated outputs (reports, analysis results)
 # =============================================================================
 Output/
+.env_hash
 
 # =============================================================================
 # External repositories (cloned during setup)
