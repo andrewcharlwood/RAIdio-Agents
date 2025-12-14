@@ -5,6 +5,7 @@ Wraps the M3D-LaMed-Phi-3-4B model for 3D medical image VQA.
 Based on paper: arXiv:2404.00578v1
 """
 
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -12,6 +13,32 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# Regex patterns for cleaning model output
+# Matches bounding box coordinates like [0.094, 0.348, 0.605, 0.312, 0.715, 0.824]
+BOUNDING_BOX_PATTERN = re.compile(r'\[[\d\.\s,]+\]')
+
+# Conversational prefixes to strip
+CONVERSATIONAL_PREFIXES = [
+    "Sure, ",
+    "Sure,",
+    "Sure. ",
+    "Sure.",
+    "Certainly, ",
+    "Certainly.",
+    "Of course, ",
+    "Of course.",
+    "Yes, ",
+    "Yes.",
+]
+
+# Patterns that indicate VQA-style responses (not clinical reports)
+VQA_PATTERNS = [
+    r"^Sure,?\s*(it is|the|I)",
+    r"^I'm very confident",
+    r"^\d+\.\d+\.",  # Starts with coordinate-like number
+]
 
 from . import register_model
 from .base import Medical3DModel
@@ -164,11 +191,111 @@ class M3DLaMedModel(Medical3DModel):
         image_tokens = self.IMAGE_PATCH_TOKEN * self.IMAGE_PATCH_COUNT
         return f"{image_tokens}{question}"
 
+    def _validate_prompt_format(self, input_ids: torch.Tensor) -> bool:
+        """
+        Validate that prompt is in correct simple format (not chat template).
+
+        Checks:
+        - BOS token at position 0
+        - <im_patch> tokens at positions 1-256
+        - No chat template role tokens present
+
+        Returns:
+            True if format is valid, raises ValueError otherwise
+        """
+        im_patch_id = self.tokenizer.convert_tokens_to_ids(self.IMAGE_PATCH_TOKEN)
+        bos_id = self.tokenizer.bos_token_id
+
+        ids_list = input_ids[0].tolist()
+
+        # Check BOS at position 0
+        if ids_list[0] != bos_id:
+            raise ValueError(
+                f"Prompt format error: BOS token not at position 0. "
+                f"Found token ID {ids_list[0]} instead of {bos_id}. "
+                f"This may indicate a chat template was incorrectly applied."
+            )
+
+        # Check <im_patch> tokens at positions 1-256
+        im_patch_positions = [i for i, tid in enumerate(ids_list) if tid == im_patch_id]
+        if len(im_patch_positions) != self.IMAGE_PATCH_COUNT:
+            raise ValueError(
+                f"Prompt format error: Expected {self.IMAGE_PATCH_COUNT} <im_patch> tokens, "
+                f"found {len(im_patch_positions)}."
+            )
+
+        if im_patch_positions[0] != 1 or im_patch_positions[-1] != self.IMAGE_PATCH_COUNT:
+            raise ValueError(
+                f"Prompt format error: <im_patch> tokens not at positions 1-{self.IMAGE_PATCH_COUNT}. "
+                f"First at {im_patch_positions[0]}, last at {im_patch_positions[-1]}. "
+                f"This may indicate a chat template was incorrectly applied."
+            )
+
+        # Check for chat template role tokens
+        vocab = self.tokenizer.get_vocab()
+        role_tokens = ["<|user|>", "<|assistant|>", "<|system|>", "[INST]", "[/INST]"]
+        for rt in role_tokens:
+            if rt in vocab:
+                rt_id = vocab[rt]
+                if rt_id in ids_list:
+                    raise ValueError(
+                        f"Prompt format error: Chat template role token '{rt}' detected. "
+                        f"M3D-LaMed requires simple prompt format, NOT chat templates!"
+                    )
+
+        return True
+
+    def _clean_response(self, response: str) -> str:
+        """
+        Clean model response by removing artifacts and unwanted patterns.
+
+        Removes:
+        - Bounding box coordinates like [0.094, 0.348, ...]
+        - Conversational prefixes like "Sure, it is..."
+        - Extra whitespace
+
+        Args:
+            response: Raw model response
+
+        Returns:
+            Cleaned response string
+        """
+        cleaned = response.strip()
+
+        # Remove bounding box coordinates
+        cleaned = BOUNDING_BOX_PATTERN.sub('', cleaned)
+
+        # Remove conversational prefixes (case-insensitive for first letter)
+        for prefix in CONVERSATIONAL_PREFIXES:
+            if cleaned.lower().startswith(prefix.lower()):
+                cleaned = cleaned[len(prefix):]
+                break
+
+        # Also handle "Sure, it is [something]" pattern
+        for pattern in VQA_PATTERNS:
+            match = re.match(pattern, cleaned, re.IGNORECASE)
+            if match:
+                # Remove the matched prefix
+                cleaned = cleaned[match.end():]
+                break
+
+        # Clean up extra whitespace from removals
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        cleaned = cleaned.strip()
+
+        # Capitalize first letter if needed
+        if cleaned and cleaned[0].islower():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+
+        return cleaned
+
     def generate_response(
         self,
         image: Union[str, np.ndarray, torch.Tensor],
         question: str,
         modality: str = "CT",
+        validate_prompt: bool = True,
+        clean_output: bool = True,
     ) -> str:
         """
         Generate a response for a question about an image.
@@ -177,6 +304,8 @@ class M3DLaMedModel(Medical3DModel):
             image: DICOM path, preprocessed array, or tensor
             question: Question to ask about the image
             modality: "CT" or "MRI"
+            validate_prompt: If True, validate prompt format before generation
+            clean_output: If True, clean response to remove artifacts
 
         Returns:
             Model's response string
@@ -194,6 +323,10 @@ class M3DLaMedModel(Medical3DModel):
             prompt,
             return_tensors="pt",
         ).input_ids.to(self.device)
+
+        # Validate prompt format (catches chat template issues)
+        if validate_prompt:
+            self._validate_prompt_format(input_ids)
 
         input_len = input_ids.shape[1]
 
@@ -220,7 +353,13 @@ class M3DLaMedModel(Medical3DModel):
         else:
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        return response.strip()
+        response = response.strip()
+
+        # Clean response to remove artifacts (bounding boxes, conversational prefixes)
+        if clean_output:
+            response = self._clean_response(response)
+
+        return response
 
     def generate_with_segmentation(
         self,
@@ -283,9 +422,9 @@ class M3DLaMedModel(Medical3DModel):
 
                     if seg_mask.sum() > 0:
                         seg_np = seg_mask[0, 0].cpu().numpy()
-                        return response.strip(), seg_np
+                        return self._clean_response(response), seg_np
 
-                return response.strip(), None
+                return self._clean_response(response), None
             else:
                 outputs = result[0] if isinstance(result, tuple) else result
                 if outputs.shape[1] > input_len:
@@ -293,7 +432,7 @@ class M3DLaMedModel(Medical3DModel):
                     response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
                 else:
                     response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                return response.strip(), None
+                return self._clean_response(response), None
 
         except RuntimeError as e:
             if "expected a non-empty list" in str(e) or "cat()" in str(e):

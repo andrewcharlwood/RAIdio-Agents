@@ -66,10 +66,12 @@ class Med3DVLMModel(Medical3DModel):
         """
         Preprocess volume for Med3DVLM input.
 
-        Med3DVLM expects 128x256x256 volumes. This method handles:
+        Med3DVLM expects 128x256x256 volumes (NOT 32x256x256 like M3D-LaMed).
+        This method handles:
         - Resizing to target dimensions
         - Normalization
         - Adding batch/channel dimensions
+        - Shape validation
         """
         from ..preprocessing import DICOMPreprocessor
         from scipy.ndimage import zoom
@@ -128,9 +130,20 @@ class Med3DVLMModel(Medical3DModel):
         elif volume.ndim == 4:
             volume = volume[np.newaxis, ...]
 
-        return torch.from_numpy(volume.astype(np.float32)).to(
+        tensor = torch.from_numpy(volume.astype(np.float32)).to(
             dtype=torch.bfloat16, device=self.device
         )
+
+        # Validate final shape - Med3DVLM REQUIRES 128 depth, not 32!
+        expected_shape = (1, 1, 128, 256, 256)
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                f"Med3DVLM input shape error: got {tuple(tensor.shape)}, "
+                f"expected {expected_shape}. "
+                f"Note: Med3DVLM uses 128 depth slices, NOT 32 like M3D-LaMed!"
+            )
+
+        return tensor
 
     def load_model(self) -> None:
         """Load Med3DVLM model and tokenizer."""
@@ -210,7 +223,7 @@ class Med3DVLMModel(Medical3DModel):
         """
         self.ensure_loaded()
 
-        # Prepare image tensor
+        # Prepare image tensor (includes shape validation)
         image_tensor = self.preprocess_tensor(image, modality)
 
         # Tokenize the question
@@ -222,16 +235,39 @@ class Med3DVLMModel(Medical3DModel):
             max_length=1024,
         ).to(self.device)
 
+        # Med3DVLM may use different parameter names for image input
+        # Try 'images' first (most likely), fall back to 'pixel_values'
+        generation_kwargs = {
+            "attention_mask": inputs.attention_mask,
+            "max_new_tokens": self.max_new_tokens,
+            "temperature": 0.7,  # Lowered from 1.0 for more coherent output
+            "do_sample": True,
+            "top_p": 0.9,
+        }
+
         with torch.no_grad():
-            # Med3DVLM generate signature expects 'inputs' param (not 'input_ids')
-            outputs = self.model.generate(
-                images=image_tensor,
-                inputs=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                max_new_tokens=self.max_new_tokens,
-                temperature=1.0,
-                do_sample=True,
-            )
+            try:
+                # Attempt 1: Use 'images' and 'inputs' parameters
+                outputs = self.model.generate(
+                    images=image_tensor,
+                    inputs=inputs.input_ids,
+                    **generation_kwargs,
+                )
+            except TypeError:
+                try:
+                    # Attempt 2: Use 'pixel_values' and 'input_ids' parameters
+                    outputs = self.model.generate(
+                        pixel_values=image_tensor,
+                        input_ids=inputs.input_ids,
+                        **generation_kwargs,
+                    )
+                except TypeError:
+                    # Attempt 3: Use positional arguments
+                    outputs = self.model.generate(
+                        image_tensor,
+                        inputs.input_ids,
+                        **generation_kwargs,
+                    )
 
         # Decode response
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -240,7 +276,14 @@ class Med3DVLMModel(Medical3DModel):
         if question in response:
             response = response.split(question)[-1]
 
-        return response.strip()
+        response = response.strip()
+
+        # Check for common error indicators
+        if response in ["?", "", "."]:
+            # Return a more informative message instead of cryptic output
+            return "(Model produced no meaningful response - possible input format issue)"
+
+        return response
 
     def analyse_scan(
         self,

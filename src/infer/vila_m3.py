@@ -12,6 +12,7 @@ Features:
 """
 
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +21,22 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from tqdm import tqdm
+
+
+# Patterns for cleaning VISTA3D/expert model output leakage
+VISTA3D_PATTERNS = [
+    r'identified by VISTA3D:\s*[^.]*\.',  # "identified by VISTA3D: red: liver, ..."
+    r'as identified by VISTA3D[^.]*\.',
+    r'VISTA3D identifies[^.]*\.',
+    r'VISTA3D segmentation[^.]*\.',
+    r'(?:red|blue|green|yellow|orange|purple|pink|gray|grey|brown|white):\s*\w+(?:\s+\w+)*,?\s*',  # color labels
+]
+
+# Modality confusion patterns
+MODALITY_PATTERNS = {
+    "MRI": [r'\bCT image\b', r'\bCT scan\b', r'\bcomputed tomography\b'],
+    "CT": [r'\bMRI image\b', r'\bMRI scan\b', r'\bmagnetic resonance\b'],
+}
 
 from . import register_model
 from .base import Medical3DModel
@@ -293,6 +310,44 @@ class VILAm3Model(Medical3DModel):
 
         raise ValueError(f"Unsupported image type: {type(image)}")
 
+    def _clean_response(self, response: str, modality: str = "CT") -> str:
+        """
+        Clean VILA-M3 response by removing expert model artifacts.
+
+        Removes:
+        - VISTA3D segmentation labels (e.g., "identified by VISTA3D: red: liver...")
+        - Color-coded anatomical labels (e.g., "red: spinal cord, yellow: skull")
+        - Corrects modality confusion (MRI described as CT or vice versa)
+
+        Args:
+            response: Raw model response
+            modality: Actual modality of the scan
+
+        Returns:
+            Cleaned response string
+        """
+        cleaned = response.strip()
+
+        # Remove VISTA3D labels and color-coded anatomy descriptions
+        for pattern in VISTA3D_PATTERNS:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+
+        # Fix modality confusion (e.g., MRI scan called "CT image")
+        if modality in MODALITY_PATTERNS:
+            wrong_modality_terms = MODALITY_PATTERNS[modality]
+            correct_term = f"{modality} image" if "image" in wrong_modality_terms[0] else f"{modality} scan"
+
+            for wrong_pattern in wrong_modality_terms:
+                cleaned = re.sub(wrong_pattern, correct_term, cleaned, flags=re.IGNORECASE)
+
+        # Clean up multiple spaces and empty sentences
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        cleaned = re.sub(r'\.\s*\.', '.', cleaned)  # Multiple periods
+        cleaned = re.sub(r'^\s*,\s*', '', cleaned)  # Leading comma
+        cleaned = cleaned.strip()
+
+        return cleaned
+
     def generate_response(
         self,
         image: Union[str, np.ndarray, torch.Tensor],
@@ -300,6 +355,7 @@ class VILAm3Model(Medical3DModel):
         modality: str = "CT",
         slice_index: Optional[int] = None,
         use_experts: Optional[bool] = None,
+        clean_output: bool = True,
     ) -> str:
         """
         Generate a response for a question about an image.
@@ -310,6 +366,7 @@ class VILAm3Model(Medical3DModel):
             modality: "CT" or "MRI"
             slice_index: Specific slice to analyze (for 3D volumes)
             use_experts: Whether to enable expert models (overrides init setting)
+            clean_output: If True, clean response to remove expert model artifacts
 
         Returns:
             Model's response string
@@ -319,12 +376,16 @@ class VILAm3Model(Medical3DModel):
         # Prepare image
         image_path = self._prepare_image(image, modality)
 
+        # Include modality context in the question to reduce confusion
+        modality_context = f"This is a {modality} scan. "
+        question_with_context = f"{modality_context}{question}"
+
         # Build message structure
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"<image>{question}"},
+                    {"type": "text", "text": f"<image>{question_with_context}"},
                     {"type": "image_path", "image_path": image_path},
                 ]
             }
@@ -338,7 +399,13 @@ class VILAm3Model(Medical3DModel):
             top_p=0.9,
         )
 
-        return response.strip()
+        response = response.strip()
+
+        # Clean response to remove expert model artifacts
+        if clean_output:
+            response = self._clean_response(response, modality)
+
+        return response
 
     def generate_with_segmentation(
         self,
