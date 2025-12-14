@@ -22,7 +22,7 @@ DEFAULT_MODEL_DIR = Path(__file__).parent.parent / "models"
 # Model configurations
 MODEL_CONFIGS = {
     "m3d-lamed": {
-        "repo_id": "GoodBaiBai88/M3D-LaMed-Phi-3-4B",
+        "repo_id": "Areeb-02/M3D-LaMed-Phi-3-4B-finetuned",
         "local_dir": "M3D-LaMed-Phi-3-4B",
         "ignore_patterns": ["model.bin"],  # Skip legacy format, use SafeTensors
         "description": "M3D-LaMed-Phi-3-4B (VQA, ~16GB)",
