@@ -1,0 +1,280 @@
+"""
+Med3DVLM Model Implementation
+
+Wraps the Med3DVLM model for 3D medical image VQA.
+Based on paper: arXiv:2503.20047
+
+Features:
+- Input: 128x256x256 single-channel volumes
+- Base LLM: Qwen 2.5-7B
+- Vision encoder: DCFormer with decomposed 3D convolutions
+- Supports: VQA, Report Generation, Image-Text Retrieval
+"""
+
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from . import register_model
+from .base import Medical3DModel
+
+
+# Default analysis questions
+DEFAULT_ANALYSIS_QUESTIONS = [
+    ("abnormalities", "Identify any abnormalities or pathological findings visible in this scan. Describe their location, appearance, and clinical significance."),
+    ("key_findings", "What are the most clinically significant findings in this image? List them in order of importance."),
+    ("differential", "Based on the findings in this scan, what differential diagnoses would you consider?"),
+]
+
+
+@register_model("med3dvlm")
+class Med3DVLMModel(Medical3DModel):
+    """
+    Med3DVLM model for 3D medical image VQA.
+
+    Features:
+    - Input: 128x256x256 single-channel volumes (4x depth vs M3D-LaMed)
+    - Base LLM: Qwen 2.5-7B
+    - Uses AutoProcessor for tokenization
+    - Dual-stream MLP-Mixer projector for multimodal fusion
+    """
+
+    name = "med3dvlm"
+    model_type = "vqa"
+
+    @classmethod
+    def get_default_model_path(cls) -> Path:
+        """Return the default path to Med3DVLM model files."""
+        return Path(__file__).parent.parent.parent / "models" / "Med3DVLM"
+
+    def get_input_shape(self) -> Tuple[int, int, int]:
+        """Return expected input shape (D, H, W)."""
+        return (128, 256, 256)
+
+    def get_channels(self) -> int:
+        """Return number of input channels (1 for grayscale)."""
+        return 1
+
+    def preprocess_tensor(
+        self,
+        volume: np.ndarray,
+        modality: str = "CT"
+    ) -> torch.Tensor:
+        """
+        Preprocess volume for Med3DVLM input.
+
+        Med3DVLM expects 128x256x256 volumes. This method handles:
+        - Resizing to target dimensions
+        - Normalization
+        - Adding batch/channel dimensions
+        """
+        from ..preprocessing import DICOMPreprocessor
+
+        # If string path, preprocess from DICOM
+        if isinstance(volume, str):
+            preprocessor = DICOMPreprocessor(
+                target_spacing=(1.0, 1.0, 1.0),
+                target_size=self.get_input_shape(),
+                modality=modality,
+            )
+            volume = preprocessor.process(volume)
+
+        # Already a tensor
+        if isinstance(volume, torch.Tensor):
+            tensor = volume.to(dtype=self.dtype, device=self.device)
+            if tensor.ndim == 4:
+                tensor = tensor.unsqueeze(0)
+            return tensor
+
+        # Numpy array
+        if volume.ndim == 4:
+            volume = volume[np.newaxis, ...]
+
+        return torch.from_numpy(volume).to(dtype=self.dtype, device=self.device)
+
+    def load_model(self) -> None:
+        """Load Med3DVLM model and tokenizer."""
+        if self._loaded:
+            return
+
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+        except ImportError:
+            raise ImportError("transformers package required for Med3DVLM")
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                f"Med3DVLM model not found at {self.model_path}. "
+                "Please download with: python scripts/download_model.py --model med3dvlm"
+            )
+
+        print(f"Loading Med3DVLM tokenizer from {self.model_path}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            str(self.model_path),
+            trust_remote_code=True,
+        )
+
+        print(f"Loading Med3DVLM model from {self.model_path}...")
+        print(f"  Device: {self.device}")
+        print(f"  Dtype: bfloat16")
+        print(f"  Note: Model is ~33GB, loading may take a few minutes...")
+
+        # Med3DVLM uses bfloat16 and has custom modeling code
+        self.model = AutoModelForCausalLM.from_pretrained(
+            str(self.model_path),
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
+        self.model.eval()
+        self._loaded = True
+        print("Med3DVLM model loaded successfully!")
+
+        mem = self.get_memory_usage()
+        print(f"GPU Memory: {mem['allocated_gb']:.2f}GB allocated, {mem['reserved_gb']:.2f}GB reserved")
+
+    def unload_model(self) -> None:
+        """Unload model to free GPU memory."""
+        if self.model is not None:
+            del self.model
+            self.model = None
+
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+
+        self._loaded = False
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print("Med3DVLM model unloaded.")
+
+    def generate_response(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        question: str,
+        modality: str = "CT",
+    ) -> str:
+        """
+        Generate a response for a question about an image.
+
+        Args:
+            image: DICOM path, preprocessed array, or tensor
+            question: Question to ask about the image
+            modality: "CT" or "MRI"
+
+        Returns:
+            Model's response string
+        """
+        self.ensure_loaded()
+
+        # Prepare image tensor
+        image_tensor = self.preprocess_tensor(image, modality)
+
+        # Tokenize the question
+        inputs = self.tokenizer(
+            question,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=1024,
+        ).to(self.device)
+
+        with torch.no_grad():
+            # Med3DVLM generate signature
+            outputs = self.model.generate(
+                images=image_tensor,
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                temperature=1.0,
+                do_sample=True,
+            )
+
+        # Decode response
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Remove the input question from response if present
+        if question in response:
+            response = response.split(question)[-1]
+
+        return response.strip()
+
+    def analyse_scan(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        modality: str = "CT",
+        analysis_questions: Optional[List[tuple]] = None,
+        segment: bool = False,
+    ) -> Dict:
+        """
+        Run comprehensive scan analysis with open-ended questions.
+        """
+        self.ensure_loaded()
+
+        if analysis_questions is None:
+            analysis_questions = DEFAULT_ANALYSIS_QUESTIONS
+
+        # Prepare image tensor once
+        image_tensor = self.preprocess_tensor(image, modality)
+
+        results = {
+            "model": self.name,
+            "overall_findings": "",
+            "analysis": {},
+            "recommendations": "",
+            "segmentations": None,  # Med3DVLM doesn't support segmentation
+        }
+
+        # Overall findings
+        print("Generating overall findings...")
+        overall_question = (
+            f"Please provide a comprehensive analysis of this {modality} scan. "
+            "Describe the key anatomical structures visible, any abnormalities, "
+            "and overall image quality."
+        )
+        results["overall_findings"] = self.generate_response(
+            image_tensor, overall_question, modality
+        )
+
+        # Run each analysis question
+        print("Running analysis...")
+        for name, question in tqdm(analysis_questions, desc="Analysis"):
+            full_question = f"{question} Be specific about location and confidence level."
+            results["analysis"][name] = self.generate_response(
+                image_tensor, full_question, modality
+            )
+
+        # Recommendations
+        print("Generating recommendations...")
+        rec_question = (
+            f"Based on your analysis of this {modality} scan and any findings identified, "
+            "what clinical recommendations would you suggest?"
+        )
+        results["recommendations"] = self.generate_response(
+            image_tensor, rec_question, modality
+        )
+
+        return results
+
+    def generate_report(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        modality: str = "CT",
+    ) -> str:
+        """
+        Generate a findings report for the image.
+
+        Med3DVLM achieves 36.42% METEOR on report generation.
+        """
+        self.ensure_loaded()
+
+        image_tensor = self.preprocess_tensor(image, modality)
+
+        prompt = "Generate a detailed radiology report describing the findings in this medical image."
+
+        return self.generate_response(image_tensor, prompt, modality)

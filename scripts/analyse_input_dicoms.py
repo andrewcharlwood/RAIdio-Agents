@@ -343,7 +343,7 @@ def main():
 
     # Handle --list-models
     if args.list_models:
-        from src.models import list_models, get_model_info, list_vqa_models, list_classifier_models
+        from src.infer import list_models, get_model_info, list_vqa_models, list_classifier_models
 
         print("Available Models:")
         print("-" * 50)
@@ -554,7 +554,7 @@ def main():
 
     # Check model exists (for each model to use)
     if not args.skip_download_check:
-        from src.models import get_model_info
+        from src.infer import get_model_info
         missing_models = []
         for model_name in models_to_use:
             try:
@@ -578,7 +578,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Import modules
-    from src.models import get_model
+    from src.infer import get_model
     from src.preprocessing import preprocess_for_m3d
     from src.utils import (
         get_dicom_metadata,

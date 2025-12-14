@@ -1,0 +1,502 @@
+"""
+VILA-M3 Model Implementation
+
+Wraps the MONAI VILA-M3 vision-language model framework.
+Supports VQA with expert model integration (VISTA3D, CXR, BRATS).
+
+Features:
+- Input: 2D images or slices from 3D volumes (.nii.gz)
+- Base LLM: Llama-3 (8B) or Vicuna (3B, 13B)
+- Expert models: VISTA3D (3D CT segmentation), CXR (chest X-ray), BRATS (brain tumors)
+- Supports: VQA, Report Generation, Segmentation via experts
+"""
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from . import register_model
+from .base import Medical3DModel
+
+
+# Default analysis questions
+DEFAULT_ANALYSIS_QUESTIONS = [
+    ("description", "Describe this medical image in detail. What anatomical structures are visible?"),
+    ("abnormalities", "Identify any abnormalities or pathological findings visible in this scan."),
+    ("key_findings", "What are the most clinically significant findings in this image?"),
+    ("differential", "Based on the findings, what differential diagnoses would you consider?"),
+]
+
+
+def _setup_vila_path():
+    """Add VILA framework to Python path."""
+    project_root = Path(__file__).parent.parent.parent
+    vila_root = project_root / "external" / "vila-m3"
+    vila_thirdparty = vila_root / "thirdparty" / "VILA"
+    demo_dir = vila_root / "m3" / "demo"
+
+    paths_to_add = [
+        str(vila_root),
+        str(vila_thirdparty),
+        str(demo_dir),
+    ]
+
+    for p in paths_to_add:
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+    return vila_root, demo_dir
+
+
+@register_model("vila-m3")
+@register_model("vila-m3-8b")
+class VILAm3Model(Medical3DModel):
+    """
+    VILA-M3 model for medical image VQA with expert integration.
+
+    Features:
+    - Works with 2D images and slices from 3D volumes
+    - Expert model support: VISTA3D, CXR analysis, BRATS
+    - Based on Llama-3 (8B) or Vicuna (3B, 13B)
+    """
+
+    name = "vila-m3"
+    model_type = "vqa"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
+        max_new_tokens: int = 1024,
+        model_size: str = "8b",  # "3b", "8b", or "13b"
+        enable_experts: bool = True,
+    ):
+        """
+        Initialize VILA-M3 model.
+
+        Args:
+            model_path: Path to local model or HuggingFace ID
+            device: Device to run on
+            dtype: Model dtype
+            max_new_tokens: Maximum tokens to generate
+            model_size: Model size ("3b", "8b", or "13b")
+            enable_experts: Enable expert model integration
+        """
+        # Set model size and conv_mode before calling parent init
+        self.model_size = model_size.lower()
+        self.conv_mode = "llama_3" if self.model_size == "8b" else "vicuna_v1"
+        self.enable_experts = enable_experts
+
+        # Model path: use HuggingFace ID if not specified
+        if model_path is None:
+            model_path = f"MONAI/Llama3-VILA-M3-{self.model_size.upper()}"
+
+        super().__init__(
+            model_path=str(model_path),
+            device=device,
+            dtype=dtype,
+            max_new_tokens=max_new_tokens,
+        )
+
+        self.generator = None
+        self._vila_root = None
+        self._demo_dir = None
+        self._temp_dir = None
+
+    @classmethod
+    def get_default_model_path(cls) -> Path:
+        """Return the default HuggingFace model ID."""
+        return Path("MONAI/Llama3-VILA-M3-8B")
+
+    def get_input_shape(self) -> Tuple[int, int, int]:
+        """
+        VILA-M3 works with 2D slices, not full 3D tensors.
+        Returns a nominal shape for compatibility.
+        """
+        return (1, 512, 512)  # Single slice
+
+    def get_channels(self) -> int:
+        """Return number of input channels."""
+        return 3  # RGB images
+
+    def preprocess_tensor(
+        self,
+        volume: np.ndarray,
+        modality: str = "CT"
+    ) -> torch.Tensor:
+        """
+        VILA-M3 uses its own image processing pipeline.
+        This method is not used directly - images are passed as file paths.
+        """
+        raise NotImplementedError(
+            "VILA-M3 uses file-based image processing. "
+            "Pass image paths directly to generate_response()."
+        )
+
+    def _convert_dicom_to_nifti(self, dicom_path: str) -> str:
+        """
+        Convert DICOM series to NIfTI format for VILA-M3.
+
+        Args:
+            dicom_path: Path to DICOM series directory
+
+        Returns:
+            Path to converted NIfTI file
+        """
+        try:
+            import SimpleITK as sitk
+        except ImportError:
+            raise ImportError("SimpleITK required for DICOM conversion")
+
+        if self._temp_dir is None:
+            self._temp_dir = tempfile.mkdtemp(prefix="vila_m3_")
+
+        # Read DICOM series
+        reader = sitk.ImageSeriesReader()
+        dicom_files = reader.GetGDCMSeriesFileNames(dicom_path)
+
+        if not dicom_files:
+            raise ValueError(f"No DICOM files found in {dicom_path}")
+
+        reader.SetFileNames(dicom_files)
+        image = reader.Execute()
+
+        # Save as NIfTI
+        nifti_path = os.path.join(self._temp_dir, "volume.nii.gz")
+        sitk.WriteImage(image, nifti_path)
+
+        return nifti_path
+
+    def load_model(self) -> None:
+        """Load VILA-M3 model and framework."""
+        if self._loaded:
+            return
+
+        # Setup Python path for VILA framework
+        self._vila_root, self._demo_dir = _setup_vila_path()
+
+        # Check framework exists
+        if not self._vila_root.exists():
+            raise FileNotFoundError(
+                f"VILA-M3 framework not found at {self._vila_root}. "
+                "Clone it with: git clone --recursive "
+                "https://github.com/Project-MONAI/VLM-Radiology-Agent-Framework "
+                "external/vila-m3"
+            )
+
+        print(f"Loading VILA-M3 model ({self.model_size.upper()})...")
+        print(f"  Model: {self.model_path}")
+        print(f"  Conv mode: {self.conv_mode}")
+        print(f"  Experts enabled: {self.enable_experts}")
+
+        try:
+            # Import from VILA framework
+            from gradio_m3 import M3Generator
+            from experts.utils import ImageCache
+
+            # Determine source type
+            model_path_str = str(self.model_path)
+            if model_path_str.startswith("MONAI/") or "/" not in model_path_str:
+                source = "huggingface"
+            else:
+                source = "local"
+
+            print(f"  Source: {source}")
+
+            # Create generator
+            self.generator = M3Generator(
+                source=source,
+                model_path=model_path_str,
+                conv_mode=self.conv_mode,
+            )
+
+            self._loaded = True
+            print("VILA-M3 model loaded successfully!")
+
+            mem = self.get_memory_usage()
+            print(f"GPU Memory: {mem['allocated_gb']:.2f}GB allocated")
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to load VILA-M3: {e}")
+
+    def unload_model(self) -> None:
+        """Unload model to free GPU memory."""
+        if self.generator is not None:
+            del self.generator
+            self.generator = None
+
+        self._loaded = False
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Cleanup temp directory
+        if self._temp_dir and os.path.exists(self._temp_dir):
+            import shutil
+            shutil.rmtree(self._temp_dir)
+            self._temp_dir = None
+
+        print("VILA-M3 model unloaded.")
+
+    def _prepare_image(self, image: Union[str, np.ndarray, torch.Tensor], modality: str) -> str:
+        """
+        Prepare image for VILA-M3 processing.
+
+        Args:
+            image: DICOM path, image path, or array
+            modality: CT or MRI
+
+        Returns:
+            Path to image file (.nii.gz for 3D, .jpg/.png for 2D)
+        """
+        if isinstance(image, str):
+            path = Path(image)
+
+            # Check if it's a DICOM directory
+            if path.is_dir():
+                # Convert DICOM to NIfTI
+                return self._convert_dicom_to_nifti(image)
+
+            # Check if it's already a supported file
+            if path.suffix.lower() in ['.nii', '.gz', '.jpg', '.jpeg', '.png']:
+                return str(path)
+
+            raise ValueError(f"Unsupported image path: {image}")
+
+        elif isinstance(image, (np.ndarray, torch.Tensor)):
+            # Save array as NIfTI
+            if self._temp_dir is None:
+                self._temp_dir = tempfile.mkdtemp(prefix="vila_m3_")
+
+            if isinstance(image, torch.Tensor):
+                image = image.cpu().numpy()
+
+            # Remove batch/channel dims if present
+            while image.ndim > 3:
+                image = image[0]
+
+            try:
+                import SimpleITK as sitk
+                sitk_image = sitk.GetImageFromArray(image)
+                nifti_path = os.path.join(self._temp_dir, "volume.nii.gz")
+                sitk.WriteImage(sitk_image, nifti_path)
+                return nifti_path
+            except ImportError:
+                raise ImportError("SimpleITK required for array processing")
+
+        raise ValueError(f"Unsupported image type: {type(image)}")
+
+    def generate_response(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        question: str,
+        modality: str = "CT",
+        slice_index: Optional[int] = None,
+        use_experts: Optional[bool] = None,
+    ) -> str:
+        """
+        Generate a response for a question about an image.
+
+        Args:
+            image: DICOM path, image path, or array
+            question: Question to ask about the image
+            modality: "CT" or "MRI"
+            slice_index: Specific slice to analyze (for 3D volumes)
+            use_experts: Whether to enable expert models (overrides init setting)
+
+        Returns:
+            Model's response string
+        """
+        self.ensure_loaded()
+
+        # Prepare image
+        image_path = self._prepare_image(image, modality)
+
+        # Build message structure
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"<image>{question}"},
+                    {"type": "image_path", "image_path": image_path},
+                ]
+            }
+        ]
+
+        # Generate response
+        response = self.generator.generate_response(
+            messages=messages,
+            max_tokens=self.max_new_tokens,
+            temperature=0.0,
+            top_p=0.9,
+        )
+
+        return response.strip()
+
+    def generate_with_segmentation(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        question: str,
+        modality: str = "CT",
+        segmentation_target: str = "everything",
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Generate response with VISTA3D segmentation.
+
+        Args:
+            image: DICOM path or array
+            question: Question about the image
+            modality: "CT" or "MRI"
+            segmentation_target: What to segment ("everything", "organs", etc.)
+
+        Returns:
+            Tuple of (response_text, path_to_segmentation_file)
+        """
+        self.ensure_loaded()
+
+        # Prepare image
+        image_path = self._prepare_image(image, modality)
+
+        # First, ask the model to trigger VISTA3D
+        seg_prompt = f"Please segment the {segmentation_target} in this image using VISTA3D."
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"<image>{seg_prompt}"},
+                    {"type": "image_path", "image_path": image_path},
+                ]
+            }
+        ]
+
+        # Generate - this should trigger VISTA3D if experts are enabled
+        response = self.generator.generate_response(
+            messages=messages,
+            max_tokens=self.max_new_tokens,
+            temperature=0.0,
+            top_p=0.9,
+        )
+
+        # Check if segmentation was created
+        seg_path = None
+        if self._temp_dir:
+            potential_seg = os.path.join(self._temp_dir, "segmentation.nii.gz")
+            if os.path.exists(potential_seg):
+                seg_path = potential_seg
+
+        # Now answer the original question
+        if question != seg_prompt:
+            final_response = self.generate_response(image, question, modality)
+        else:
+            final_response = response
+
+        return final_response, seg_path
+
+    def analyse_scan(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        modality: str = "CT",
+        analysis_questions: Optional[List[tuple]] = None,
+        segment: bool = False,
+    ) -> Dict:
+        """
+        Run comprehensive scan analysis.
+
+        Args:
+            image: DICOM path or array
+            modality: "CT" or "MRI"
+            analysis_questions: List of (name, question) tuples
+            segment: Whether to run VISTA3D segmentation
+
+        Returns:
+            Dictionary with analysis results
+        """
+        self.ensure_loaded()
+
+        if analysis_questions is None:
+            analysis_questions = DEFAULT_ANALYSIS_QUESTIONS
+
+        # Prepare image once
+        image_path = self._prepare_image(image, modality)
+
+        results = {
+            "model": self.name,
+            "model_size": self.model_size,
+            "overall_findings": "",
+            "analysis": {},
+            "recommendations": "",
+            "segmentation_path": None,
+        }
+
+        # Overall findings
+        print("Generating overall findings...")
+        overall_question = (
+            f"Please provide a comprehensive analysis of this {modality} scan. "
+            "Describe the key anatomical structures visible, any abnormalities, "
+            "and overall image quality."
+        )
+        results["overall_findings"] = self.generate_response(
+            image_path, overall_question, modality
+        )
+
+        # Run segmentation if requested
+        if segment and modality == "CT":
+            print("Running VISTA3D segmentation...")
+            try:
+                _, seg_path = self.generate_with_segmentation(
+                    image_path, "Segment everything", modality, "everything"
+                )
+                results["segmentation_path"] = seg_path
+            except Exception as e:
+                print(f"  Segmentation failed: {e}")
+
+        # Run each analysis question
+        print("Running analysis...")
+        for name, question in tqdm(analysis_questions, desc="Analysis"):
+            results["analysis"][name] = self.generate_response(
+                image_path, question, modality
+            )
+
+        # Recommendations
+        print("Generating recommendations...")
+        rec_question = (
+            f"Based on your analysis of this {modality} scan and any findings, "
+            "what clinical recommendations would you suggest?"
+        )
+        results["recommendations"] = self.generate_response(
+            image_path, rec_question, modality
+        )
+
+        return results
+
+
+@register_model("vila-m3-3b")
+class VILAm3Model3B(VILAm3Model):
+    """VILA-M3 3B variant."""
+
+    name = "vila-m3-3b"
+
+    def __init__(self, model_path: Optional[str] = None, **kwargs):
+        if model_path is None:
+            model_path = "MONAI/Llama3-VILA-M3-3B"
+        super().__init__(model_path=model_path, model_size="3b", **kwargs)
+
+
+@register_model("vila-m3-13b")
+class VILAm3Model13B(VILAm3Model):
+    """VILA-M3 13B variant."""
+
+    name = "vila-m3-13b"
+
+    def __init__(self, model_path: Optional[str] = None, **kwargs):
+        if model_path is None:
+            model_path = "MONAI/Llama3-VILA-M3-13B"
+        super().__init__(model_path=model_path, model_size="13b", **kwargs)

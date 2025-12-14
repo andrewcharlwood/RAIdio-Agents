@@ -385,7 +385,7 @@ if [ "$RUN_TEST" = true ]; then
 
     log_info "Testing model imports..."
     python -c "
-from src.models import list_models, get_model_info
+from src.infer import list_models, get_model_info
 print('Available models:', list_models())
 for m in list_models():
     try:

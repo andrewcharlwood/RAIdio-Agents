@@ -4,8 +4,8 @@ Model Inference Wrapper for M3D-LaMed
 This module provides backwards-compatible access to the M3D-LaMed model
 while supporting the new multi-model architecture.
 
-For new code, prefer using the models module directly:
-    from src.models import get_model, list_models
+For new code, prefer using the infer module directly:
+    from src.infer import get_model, list_models
     model = get_model("m3d-lamed")
 """
 
@@ -16,8 +16,8 @@ import numpy as np
 import torch
 
 # Import the new model system
-from .models import get_model, list_models
-from .models.m3d_lamed import M3DLaMedModel, DEFAULT_ANALYSIS_QUESTIONS
+from .infer import get_model, list_models
+from .infer.m3d_lamed import M3DLaMedModel, DEFAULT_ANALYSIS_QUESTIONS
 
 # Re-export for backwards compatibility
 from .preprocessing import preprocess_for_m3d
@@ -45,9 +45,9 @@ class M3DLaMedInference:
     Backwards-compatible wrapper for M3D-LaMed model.
 
     This class wraps the new M3DLaMedModel to maintain compatibility
-    with existing code. For new code, consider using the models module:
+    with existing code. For new code, consider using the infer module:
 
-        from src.models import get_model
+        from src.infer import get_model
         model = get_model("m3d-lamed")
         model.load_model()
         response = model.generate_response(image, question, modality)
