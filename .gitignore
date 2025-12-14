@@ -139,3 +139,4 @@ tmp/
 *.nii
 *.nii.gz
 CLAUDE.md
+*.md

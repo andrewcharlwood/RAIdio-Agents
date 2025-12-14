@@ -66,6 +66,12 @@ class CTCLIPModel(Medical3DModel):
     name = "ct-clip"
     model_type = "classifier"
 
+    def __init__(self, **kwargs):
+        """Initialize CT-CLIP with float32 dtype (required by model architecture)."""
+        # CT-CLIP requires float32 - override any dtype setting
+        kwargs['dtype'] = torch.float32
+        super().__init__(**kwargs)
+
     @classmethod
     def get_default_model_path(cls) -> Path:
         """Return the default path to CT-CLIP model files."""
@@ -75,10 +81,9 @@ class CTCLIPModel(Medical3DModel):
         """
         Return expected input shape (D, H, W).
 
-        CT-CLIP input size is not strictly documented.
-        Using common 3D medical imaging dimensions.
+        CT-CLIP uses CTViT with image_size=480 and expects 240 depth slices.
         """
-        return (64, 256, 256)
+        return (240, 480, 480)
 
     def get_channels(self) -> int:
         """Return number of input channels (1 for grayscale)."""
@@ -92,31 +97,56 @@ class CTCLIPModel(Medical3DModel):
         """
         Preprocess volume for CT-CLIP input.
 
-        CT-CLIP is designed for chest CT scans.
+        CT-CLIP expects:
+        - Shape: (B, C, D, H, W) = (1, 1, 240, 480, 480)
+        - HU values clipped to [-1000, 1000] and normalized by /1000
         """
-        from ..preprocessing import DICOMPreprocessor
+        from scipy.ndimage import zoom
 
-        # If string path, preprocess from DICOM
+        target_shape = self.get_input_shape()  # (240, 480, 480)
+
+        # Handle string path
         if isinstance(volume, str):
+            from ..preprocessing import DICOMPreprocessor
             preprocessor = DICOMPreprocessor(
-                target_spacing=(1.0, 1.0, 1.0),
-                target_size=self.get_input_shape(),
-                modality="CT",  # CT-CLIP is CT-only
+                target_spacing=(1.5, 0.75, 0.75),  # CT-CLIP default spacing
+                target_size=None,  # Don't resize yet, we'll do custom resize
+                modality="CT",
             )
             volume = preprocessor.process(volume)
 
-        # Already a tensor
+        # Convert tensor to numpy
         if isinstance(volume, torch.Tensor):
-            tensor = volume.to(dtype=self.dtype, device=self.device)
-            if tensor.ndim == 4:
-                tensor = tensor.unsqueeze(0)
-            return tensor
+            volume = volume.cpu().numpy()
 
-        # Numpy array
-        if volume.ndim == 4:
-            volume = volume[np.newaxis, ...]
+        volume = np.asarray(volume, dtype=np.float32)
 
-        return torch.from_numpy(volume).to(dtype=self.dtype, device=self.device)
+        # Remove batch/channel dimensions to get (D, H, W)
+        while volume.ndim > 3:
+            volume = volume[0]
+
+        # Ensure HU range [-1000, 1000] and normalize
+        # If already normalized to [0,1], denormalize first
+        if volume.min() >= 0 and volume.max() <= 1:
+            # Assume it was normalized with soft tissue window
+            # Convert back to approximate HU range for CT-CLIP normalization
+            volume = volume * 2000 - 1000  # Map [0,1] to [-1000, 1000]
+
+        volume = np.clip(volume, -1000, 1000)
+        volume = volume / 1000.0  # CT-CLIP normalization
+
+        # Resize to target shape (240, 480, 480)
+        current_shape = volume.shape
+        if current_shape != target_shape:
+            zoom_factors = tuple(t / c for t, c in zip(target_shape, current_shape))
+            volume = zoom(volume, zoom_factors, order=1)
+
+        # Add channel and batch dimensions: (D, H, W) -> (1, 1, D, H, W)
+        volume = volume[np.newaxis, np.newaxis, ...]
+
+        return torch.from_numpy(volume.astype(np.float32)).to(
+            dtype=self.dtype, device=self.device
+        )
 
     def load_model(self) -> None:
         """Load CT-CLIP model."""
@@ -131,8 +161,10 @@ class CTCLIPModel(Medical3DModel):
             )
 
         try:
-            # Try to import CT-CLIP (module name is lowercase)
+            # Import required modules
             from ct_clip import CTCLIP
+            from transformer_maskgit import CTViT
+            from transformers import BertTokenizer, BertModel
 
             print(f"Loading CT-CLIP model from {self.model_path}...")
             print(f"  Device: {self.device}")
@@ -161,19 +193,67 @@ class CTCLIPModel(Medical3DModel):
                         f"--local-dir {self.model_path}"
                     )
 
-            # Initialize model and load weights
-            self.model = CTCLIP()
+            # Initialize tokenizer for text encoding
+            print("  Loading BiomedVLP-CXR-BERT tokenizer...")
+            self.tokenizer = BertTokenizer.from_pretrained(
+                'microsoft/BiomedVLP-CXR-BERT-specialized',
+                do_lower_case=True
+            )
+
+            # Initialize text encoder (BERT)
+            print("  Loading BiomedVLP-CXR-BERT text encoder...")
+            text_encoder = BertModel.from_pretrained(
+                "microsoft/BiomedVLP-CXR-BERT-specialized"
+            )
+            text_encoder.resize_token_embeddings(len(self.tokenizer))
+
+            # Initialize image encoder (CTViT)
+            print("  Initializing CTViT image encoder...")
+            image_encoder = CTViT(
+                dim=512,
+                codebook_size=8192,
+                image_size=480,
+                patch_size=20,
+                temporal_patch_size=10,
+                spatial_depth=4,
+                temporal_depth=4,
+                dim_head=32,
+                heads=8
+            )
+
+            # Initialize CT-CLIP with correct dimensions
+            print("  Initializing CT-CLIP model...")
+            self.model = CTCLIP(
+                image_encoder=image_encoder,
+                text_encoder=text_encoder,
+                dim_image=294912,
+                dim_text=768,
+                dim_latent=512,
+                extra_latent_projection=False,
+                use_mlm=False,
+                downsample_image_embeds=False,
+                use_all_token_embeds=False
+            )
+
+            # Load pretrained weights
+            print(f"  Loading checkpoint from {ckpt_path}...")
             checkpoint = torch.load(str(ckpt_path), map_location="cpu")
-            self.model.load_state_dict(checkpoint, strict=False)
+            # Use strict=False to handle position_ids buffer mismatch
+            missing, unexpected = self.model.load_state_dict(checkpoint, strict=False)
+            if missing:
+                print(f"  Note: {len(missing)} missing keys (expected for new components)")
+            if unexpected:
+                print(f"  Note: {len(unexpected)} unexpected keys (expected for buffer changes)")
             self.model = self.model.to(self.device)
             self.model.eval()
 
             self._loaded = True
             print("CT-CLIP model loaded successfully!")
 
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
-                "CT-CLIP package not found. Install with:\n"
+                f"CT-CLIP package or dependency not found: {e}\n"
+                "Install with:\n"
                 "  cd external/CT-CLIP/transformer_maskgit && pip install -e .\n"
                 "  cd external/CT-CLIP/CT_CLIP && pip install -e .\n"
                 "See: https://github.com/ibrahimethemhamamci/CT-CLIP"
@@ -203,6 +283,9 @@ class CTCLIPModel(Medical3DModel):
         """
         Classify image and return pathology probabilities.
 
+        CT-CLIP uses zero-shot classification by comparing text prompts:
+        "X is present" vs "X is not present" for each pathology.
+
         Args:
             image: DICOM path, preprocessed array, or tensor
             modality: Should be "CT" for CT-CLIP
@@ -218,26 +301,42 @@ class CTCLIPModel(Medical3DModel):
         # Prepare image tensor
         image_tensor = self.preprocess_tensor(image, "CT")
 
-        with torch.no_grad():
-            # Get model predictions
-            outputs = self.model(image_tensor)
+        # CT-CLIP pathology names (more readable versions)
+        pathology_names = [
+            'Medical material', 'Arterial wall calcification', 'Cardiomegaly',
+            'Pericardial effusion', 'Coronary artery wall calcification',
+            'Hiatal hernia', 'Lymphadenopathy', 'Emphysema', 'Atelectasis',
+            'Lung nodule', 'Lung opacity', 'Pulmonary fibrotic sequela',
+            'Pleural effusion', 'Mosaic attenuation pattern',
+            'Peribronchial thickening', 'Consolidation', 'Bronchiectasis',
+            'Interlobular septal thickening'
+        ]
 
-            # Convert logits to probabilities
-            if isinstance(outputs, dict):
-                logits = outputs.get("logits", outputs.get("predictions", None))
-            else:
-                logits = outputs
-
-            if logits is None:
-                raise ValueError("Could not extract predictions from CT-CLIP output")
-
-            probs = torch.sigmoid(logits).cpu().numpy()[0]
-
-        # Map to pathology names
         results = {}
-        for i, pathology in enumerate(CT_CLIP_PATHOLOGIES):
-            if i < len(probs):
-                results[pathology] = float(probs[i])
+        softmax = torch.nn.Softmax(dim=0)
+
+        with torch.no_grad():
+            for i, pathology_name in enumerate(pathology_names):
+                # Create text prompts for zero-shot classification
+                text = [f"{pathology_name} is present.", f"{pathology_name} is not present."]
+                text_tokens = self.tokenizer(
+                    text,
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512
+                ).to(self.device)
+
+                # Run model forward pass
+                output = self.model(text_tokens, image_tensor, device=self.device)
+
+                # Apply softmax to get probability of "is present"
+                probs = softmax(output)
+                prob_present = float(probs[0].cpu().numpy())
+
+                # Map to our standard pathology names
+                std_name = CT_CLIP_PATHOLOGIES[i] if i < len(CT_CLIP_PATHOLOGIES) else pathology_name.lower().replace(' ', '_')
+                results[std_name] = prob_present
 
         return results
 

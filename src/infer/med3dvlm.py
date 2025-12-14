@@ -72,28 +72,65 @@ class Med3DVLMModel(Medical3DModel):
         - Adding batch/channel dimensions
         """
         from ..preprocessing import DICOMPreprocessor
+        from scipy.ndimage import zoom
+
+        target_shape = self.get_input_shape()  # (D, H, W) = (128, 256, 256)
 
         # If string path, preprocess from DICOM
         if isinstance(volume, str):
             preprocessor = DICOMPreprocessor(
                 target_spacing=(1.0, 1.0, 1.0),
-                target_size=self.get_input_shape(),
+                target_size=target_shape,
                 modality=modality,
             )
             volume = preprocessor.process(volume)
 
-        # Already a tensor - Med3DVLM uses bfloat16
+        # Convert tensor to numpy for resizing if needed
         if isinstance(volume, torch.Tensor):
-            tensor = volume.to(dtype=torch.bfloat16, device=self.device)
-            if tensor.ndim == 4:
-                tensor = tensor.unsqueeze(0)
-            return tensor
+            volume = volume.float().cpu().numpy()  # Convert bfloat16 to float32 first
 
-        # Numpy array
-        if volume.ndim == 4:
+        # Ensure we have a numpy array at this point
+        volume = np.asarray(volume, dtype=np.float32)
+
+        # Handle different input shapes and resize to target
+        # Expected final shape: (1, 1, D, H, W) = (1, 1, 128, 256, 256)
+        if volume.ndim == 3:
+            # (D, H, W) -> add channel and batch
+            current_shape = volume.shape
+        elif volume.ndim == 4:
+            # (C, D, H, W) or (1, D, H, W)
+            current_shape = volume.shape[1:]  # Get (D, H, W)
+        elif volume.ndim == 5:
+            # (N, C, D, H, W)
+            current_shape = volume.shape[2:]  # Get (D, H, W)
+        else:
+            raise ValueError(f"Unexpected volume dimensions: {volume.ndim}")
+
+        # Resize if dimensions don't match
+        if current_shape != target_shape:
+            # Calculate zoom factors for spatial dimensions only
+            zoom_factors = tuple(t / c for t, c in zip(target_shape, current_shape))
+
+            if volume.ndim == 3:
+                volume = zoom(volume, zoom_factors, order=1)
+            elif volume.ndim == 4:
+                # Resize each channel (typically just 1)
+                resized = zoom(volume[0], zoom_factors, order=1)
+                volume = resized[np.newaxis, ...]
+            elif volume.ndim == 5:
+                # Resize the spatial dimensions for each batch/channel
+                resized = zoom(volume[0, 0], zoom_factors, order=1)
+                volume = resized[np.newaxis, np.newaxis, ...]
+
+        # Ensure proper shape: (1, 1, D, H, W)
+        if volume.ndim == 3:
+            volume = volume[np.newaxis, np.newaxis, ...]
+        elif volume.ndim == 4:
             volume = volume[np.newaxis, ...]
 
-        return torch.from_numpy(volume).to(dtype=torch.bfloat16, device=self.device)
+        return torch.from_numpy(volume.astype(np.float32)).to(
+            dtype=torch.bfloat16, device=self.device
+        )
 
     def load_model(self) -> None:
         """Load Med3DVLM model and tokenizer."""
