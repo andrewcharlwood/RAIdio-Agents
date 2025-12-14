@@ -89,6 +89,7 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
     Extract RadFM zip archive on Linux/macOS.
 
     RadFM model weights are downloaded as pytorch_model.zip (single archive).
+    Uses 7z (multithreaded) if available, falls back to unzip.
 
     Args:
         target_dir: Directory containing the downloaded archive
@@ -105,11 +106,19 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
         print(f"    Extract pytorch_model.zip")
         return False
 
-    # Check for unzip command
-    if not shutil.which("unzip"):
-        print("  Error: 'unzip' command not found. Install with:")
-        print("    Ubuntu/Debian: sudo apt-get install unzip")
-        print("    macOS: brew install unzip")
+    # Check for extraction tools - prefer 7z for multithreaded extraction
+    use_7z = shutil.which("7z") is not None
+    has_unzip = shutil.which("unzip") is not None
+
+    if use_7z:
+        print("  Using 7z for multithreaded extraction...")
+    elif has_unzip:
+        print("  Using unzip (install p7zip-full for faster multithreaded extraction)")
+    else:
+        print("  Error: No extraction tool found. Install with:")
+        print("    Ubuntu/Debian: sudo apt-get install p7zip-full  # Recommended (multithreaded)")
+        print("                   sudo apt-get install unzip       # Alternative")
+        print("    macOS: brew install p7zip")
         return False
 
     success = True
@@ -127,13 +136,24 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
         print(f"  Extracting {archive_name}...")
 
         try:
-            # For split archives, unzip will automatically find .z01, .z02, etc.
-            result = subprocess.run(
-                ["unzip", "-o", "-q", str(archive_path), "-d", str(target_dir)],
-                capture_output=True,
-                text=True,
-                cwd=str(target_dir),
-            )
+            if use_7z:
+                # 7z with multithreading enabled (-mmt=on)
+                # -o specifies output directory (no space after -o)
+                # -y answers yes to all prompts (overwrite)
+                result = subprocess.run(
+                    ["7z", "x", "-y", f"-o{target_dir}", "-mmt=on", str(archive_path)],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(target_dir),
+                )
+            else:
+                # Fall back to unzip
+                result = subprocess.run(
+                    ["unzip", "-o", "-q", str(archive_path), "-d", str(target_dir)],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(target_dir),
+                )
 
             if result.returncode != 0:
                 print(f"    Error extracting {archive_name}:")
@@ -238,14 +258,16 @@ def download_model(
                         print("  MANUAL EXTRACTION REQUIRED")
                         print("  " + "=" * 50)
                         print(f"  Navigate to: {target_dir}")
-                        print("  Run: unzip pytorch_model.zip")
+                        print("  Run: 7z x -mmt=on pytorch_model.zip  # Multithreaded (recommended)")
+                        print("   Or: unzip pytorch_model.zip")
                         print()
             else:
                 print("  " + "=" * 50)
                 print("  EXTRACTION REQUIRED (--no-extract specified)")
                 print("  " + "=" * 50)
                 print(f"  Navigate to: {target_dir}")
-                print("  Run: unzip pytorch_model.zip")
+                print("  Run: 7z x -mmt=on pytorch_model.zip  # Multithreaded (recommended)")
+                print("   Or: unzip pytorch_model.zip")
                 print()
 
         return True

@@ -131,15 +131,40 @@ class CTCLIPModel(Medical3DModel):
             )
 
         try:
-            # Try to import CT-CLIP
-            from CT_CLIP import CTCLIP
+            # Try to import CT-CLIP (module name is lowercase)
+            from ct_clip import CTCLIP
 
             print(f"Loading CT-CLIP model from {self.model_path}...")
             print(f"  Device: {self.device}")
             print(f"  Dtype: {self.dtype}")
 
-            # Load model
-            self.model = CTCLIP.from_pretrained(str(self.model_path))
+            # Check for model checkpoint file
+            ckpt_path = self.model_path / "CT-CLIP_v2.pt"
+            if not ckpt_path.exists():
+                # Check alternate locations
+                alt_paths = [
+                    self.model_path / "models" / "CT-CLIP-Related" / "CT-CLIP_v2.pt",
+                    self.model_path / "CT_CLIP_v2.pt",
+                ]
+                for alt in alt_paths:
+                    if alt.exists():
+                        ckpt_path = alt
+                        break
+                else:
+                    raise FileNotFoundError(
+                        f"CT-CLIP checkpoint not found at {self.model_path}.\n"
+                        "Please download from HuggingFace (requires authentication):\n"
+                        "  1. Request access at: https://huggingface.co/datasets/ibrahimhamamci/CT-RATE\n"
+                        "  2. Login: huggingface-cli login\n"
+                        "  3. Download: huggingface-cli download ibrahimhamamci/CT-RATE "
+                        "models/CT-CLIP-Related/CT-CLIP_v2.pt --repo-type dataset "
+                        f"--local-dir {self.model_path}"
+                    )
+
+            # Initialize model and load weights
+            self.model = CTCLIP()
+            checkpoint = torch.load(str(ckpt_path), map_location="cpu")
+            self.model.load_state_dict(checkpoint, strict=False)
             self.model = self.model.to(self.device)
             self.model.eval()
 
@@ -149,7 +174,8 @@ class CTCLIPModel(Medical3DModel):
         except ImportError:
             raise ImportError(
                 "CT-CLIP package not found. Install with:\n"
-                "  cd CT_CLIP && pip install -e .\n"
+                "  cd external/CT-CLIP/transformer_maskgit && pip install -e .\n"
+                "  cd external/CT-CLIP/CT_CLIP && pip install -e .\n"
                 "See: https://github.com/ibrahimethemhamamci/CT-CLIP"
             )
 

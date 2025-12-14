@@ -82,9 +82,9 @@ class Med3DVLMModel(Medical3DModel):
             )
             volume = preprocessor.process(volume)
 
-        # Already a tensor
+        # Already a tensor - Med3DVLM uses bfloat16
         if isinstance(volume, torch.Tensor):
-            tensor = volume.to(dtype=self.dtype, device=self.device)
+            tensor = volume.to(dtype=torch.bfloat16, device=self.device)
             if tensor.ndim == 4:
                 tensor = tensor.unsqueeze(0)
             return tensor
@@ -93,7 +93,7 @@ class Med3DVLMModel(Medical3DModel):
         if volume.ndim == 4:
             volume = volume[np.newaxis, ...]
 
-        return torch.from_numpy(volume).to(dtype=self.dtype, device=self.device)
+        return torch.from_numpy(volume).to(dtype=torch.bfloat16, device=self.device)
 
     def load_model(self) -> None:
         """Load Med3DVLM model and tokenizer."""
@@ -186,10 +186,11 @@ class Med3DVLMModel(Medical3DModel):
         ).to(self.device)
 
         with torch.no_grad():
-            # Med3DVLM generate signature
+            # Med3DVLM generate signature expects 'inputs' param (not 'input_ids')
             outputs = self.model.generate(
                 images=image_tensor,
-                **inputs,
+                inputs=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
                 max_new_tokens=self.max_new_tokens,
                 temperature=1.0,
                 do_sample=True,
