@@ -291,12 +291,58 @@ def download_radfm_language_files(target_dir: Path) -> bool:
     return False
 
 
+def is_model_ready(model_name: str, target_dir: Path) -> bool:
+    """
+    Check if a model is already downloaded and ready to use.
+
+    Args:
+        model_name: Name of the model
+        target_dir: Model directory
+
+    Returns:
+        True if model appears ready (skip download)
+    """
+    if not target_dir.exists():
+        return False
+
+    # Model-specific checks
+    if model_name == "radfm":
+        # RadFM is ready if pytorch_model.bin exists (extracted)
+        # and Language_files has tokenizer
+        weights_ready = (target_dir / "pytorch_model.bin").exists()
+        tokenizer_ready = (target_dir / "Language_files" / "tokenizer.model").exists()
+        return weights_ready and tokenizer_ready
+
+    elif model_name == "m3d-lamed":
+        # M3D-LaMed uses safetensors
+        has_safetensors = list(target_dir.glob("*.safetensors"))
+        has_config = (target_dir / "config.json").exists()
+        return len(has_safetensors) > 0 and has_config
+
+    elif model_name == "med3dvlm":
+        # Med3DVLM uses safetensors
+        has_safetensors = list(target_dir.glob("*.safetensors"))
+        has_config = (target_dir / "config.json").exists()
+        return len(has_safetensors) > 0 and has_config
+
+    elif model_name.startswith("vila-m3"):
+        # VILA-M3 models
+        has_safetensors = list(target_dir.glob("*.safetensors"))
+        has_config = (target_dir / "config.json").exists()
+        return len(has_safetensors) > 0 and has_config
+
+    else:
+        # Generic check: config.json exists
+        return (target_dir / "config.json").exists()
+
+
 def download_model(
     model_name: str,
     model_dir: Path,
     resume: bool = True,
     auto_extract: bool = True,
     cleanup_archives: bool = True,
+    force: bool = False,
 ) -> bool:
     """
     Download a specific model.
@@ -307,6 +353,7 @@ def download_model(
         resume: Enable resume download
         auto_extract: Automatically extract archives (RadFM)
         cleanup_archives: Remove archive files after extraction
+        force: Force re-download even if model exists
 
     Returns:
         True if successful
@@ -318,6 +365,13 @@ def download_model(
 
     config = MODEL_CONFIGS[model_name]
     target_dir = model_dir / config["local_dir"]
+
+    # Check if model is already ready
+    if not force and is_model_ready(model_name, target_dir):
+        print(f"Model {model_name} already downloaded and ready at {target_dir}")
+        print(f"  Use --force to re-download")
+        return True
+
     target_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Downloading {model_name}...")
@@ -415,13 +469,14 @@ def verify_model(model_name: str, model_dir: Path) -> dict:
         Dictionary with verification results
     """
     if model_name not in MODEL_CONFIGS:
-        return {"exists": False, "error": f"Unknown model: {model_name}"}
+        return {"exists": False, "ready": False, "error": f"Unknown model: {model_name}"}
 
     config = MODEL_CONFIGS[model_name]
     target_dir = model_dir / config["local_dir"]
 
     results = {
         "exists": target_dir.exists(),
+        "ready": is_model_ready(model_name, target_dir),
         "has_config": (target_dir / "config.json").exists() if target_dir.exists() else False,
         "size_gb": 0,
         "file_count": 0,
@@ -503,6 +558,11 @@ def main():
         action="store_true",
         help="Only extract archives (skip download, for RadFM)"
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force re-download even if model already exists"
+    )
 
     args = parser.parse_args()
     model_dir = Path(args.model_dir)
@@ -524,7 +584,12 @@ def main():
         print()
         for name in MODEL_CONFIGS:
             results = verify_model(name, model_dir)
-            status = "OK" if results["exists"] and (results["has_config"] or results["file_count"] > 0) else "MISSING"
+            if results.get("ready"):
+                status = "READY"
+            elif results["exists"]:
+                status = "INCOMPLETE"
+            else:
+                status = "MISSING"
             print(f"  {name}: {status}")
             if results["exists"]:
                 print(f"    Files: {results['file_count']}, Size: {results['size_gb']:.2f} GB")
@@ -570,12 +635,13 @@ def main():
     resume = not args.no_resume
     auto_extract = not args.no_extract
     cleanup_archives = not args.keep_archives
+    force = args.force
     success_count = 0
     fail_count = 0
 
     for model_name in models_to_download:
         print("-" * 60)
-        if download_model(model_name, model_dir, resume, auto_extract, cleanup_archives):
+        if download_model(model_name, model_dir, resume, auto_extract, cleanup_archives, force):
             success_count += 1
         else:
             fail_count += 1
