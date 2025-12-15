@@ -12,6 +12,7 @@ Features:
 - Supports: VQA, Report Generation, Multi-image analysis
 """
 
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -21,6 +22,7 @@ from tqdm import tqdm
 
 from . import register_model
 from .base import Medical3DModel
+from .radfm_helpers import get_tokenizer, format_prompt_with_image, preprocess_volume_for_radfm
 
 
 # Default analysis questions
@@ -55,6 +57,11 @@ class RadFMModel(Medical3DModel):
         """Return the default path to RadFM model files."""
         return Path(__file__).parent.parent.parent / "models" / "RadFM"
 
+    @classmethod
+    def get_external_radfm_path(cls) -> Path:
+        """Return the path to external RadFM Quick_demo directory."""
+        return Path(__file__).parent.parent.parent / "external" / "RadFM" / "Quick_demo"
+
     def get_input_shape(self) -> Tuple[int, int, int]:
         """
         Return expected input shape (D, H, W).
@@ -76,8 +83,8 @@ class RadFMModel(Medical3DModel):
         """
         Preprocess volume for RadFM input.
 
-        RadFM expects 3-channel RGB input (H, W, D, 3).
-        For grayscale medical images, we repeat across channels.
+        RadFM expects (B, S, C, H, W, D) format where D is LAST.
+        This method converts our standard (D, H, W) format to RadFM's format.
         """
         from ..preprocessing import DICOMPreprocessor
 
@@ -85,38 +92,20 @@ class RadFMModel(Medical3DModel):
         if isinstance(volume, str):
             preprocessor = DICOMPreprocessor(
                 target_spacing=(1.0, 1.0, 1.0),
-                target_size=(32, 512, 512),  # RadFM typical size
+                target_size=(32, 512, 512),  # (D, H, W)
                 modality=modality,
             )
             volume = preprocessor.process(volume)
 
-        # Already a tensor
-        if isinstance(volume, torch.Tensor):
-            tensor = volume.to(dtype=self.dtype, device=self.device)
+        # Convert to RadFM format (B, S, C, H, W, D)
+        # Using helper function which handles dimension transformations
+        tensor = preprocess_volume_for_radfm(
+            volume,
+            target_shape=(512, 512, 4),  # (H, W, D)
+            modality=modality
+        )
 
-            # RadFM needs 3 channels - repeat grayscale if needed
-            if tensor.ndim == 4 and tensor.shape[0] == 1:
-                tensor = tensor.repeat(3, 1, 1, 1)  # (3, D, H, W)
-            elif tensor.ndim == 5 and tensor.shape[1] == 1:
-                tensor = tensor.repeat(1, 3, 1, 1, 1)  # (B, 3, D, H, W)
-
-            if tensor.ndim == 4:
-                tensor = tensor.unsqueeze(0)
-
-            return tensor
-
-        # Numpy array
-        if volume.ndim == 3:
-            # (D, H, W) -> (3, D, H, W)
-            volume = np.stack([volume, volume, volume], axis=0)
-        elif volume.ndim == 4 and volume.shape[0] == 1:
-            # (1, D, H, W) -> (3, D, H, W)
-            volume = np.concatenate([volume, volume, volume], axis=0)
-
-        if volume.ndim == 4:
-            volume = volume[np.newaxis, ...]
-
-        return torch.from_numpy(volume).to(dtype=self.dtype, device=self.device)
+        return tensor.to(dtype=self.dtype, device=self.device)
 
     def load_model(self) -> None:
         """Load RadFM model and tokenizer."""
@@ -129,58 +118,62 @@ class RadFMModel(Medical3DModel):
                 "Please download from https://github.com/chaoyi-wu/RadFM"
             )
 
-        # RadFM has a custom model class
-        import sys
-        sys.path.insert(0, str(self.model_path))
+        print(f"Loading RadFM model from {self.model_path}...")
+        print(f"  Device: {self.device}")
+        print(f"  Dtype: {self.dtype}")
+
+        # Add external RadFM directory to path to import custom model
+        external_path = self.get_external_radfm_path()
+        sys.path.insert(0, str(external_path))
 
         try:
-            # Try to import RadFM's custom model class
-            from model.RadFM import MultiLLaMAForCausalLM
-            from model.tokenizer import get_tokenizer
+            # Import RadFM's custom model class (capital M in Model)
+            from Model.RadFM.multimodality_model import MultiLLaMAForCausalLM
 
-            print(f"Loading RadFM model from {self.model_path}...")
-            print(f"  Device: {self.device}")
-            print(f"  Dtype: {self.dtype}")
+            # Look for Language_files in model_path or external fallback
+            lang_files = self.model_path / "Language_files"
+            if not lang_files.exists():
+                lang_files = external_path / "Language_files"
+                if not lang_files.exists():
+                    raise FileNotFoundError(
+                        f"Language_files not found in {self.model_path} or {external_path}"
+                    )
 
-            # Load tokenizer with special image tokens
-            self.tokenizer = get_tokenizer(str(self.model_path / "Language_files"))
+            print(f"  Language files: {lang_files}")
 
-            # Load model
-            self.model = MultiLLaMAForCausalLM(
-                lang_model_path=str(self.model_path / "Language_files")
+            # Load tokenizer with special image tokens using our helper
+            self.tokenizer, self.image_padding_tokens = get_tokenizer(
+                str(lang_files),
+                max_img_size=100,
+                image_num=32
             )
 
-            # Load checkpoint
+            # Initialize model
+            self.model = MultiLLaMAForCausalLM(
+                lang_model_path=str(lang_files)
+            )
+
+            # Load checkpoint weights if available
             ckpt_path = self.model_path / "pytorch_model.bin"
             if ckpt_path.exists():
+                print(f"  Loading weights from {ckpt_path}")
                 ckpt = torch.load(str(ckpt_path), map_location="cpu")
                 self.model.load_state_dict(ckpt)
+            else:
+                print(f"  Warning: No weights found at {ckpt_path}, using random initialization")
 
             self.model = self.model.to(self.device)
             self.model.eval()
 
-        except ImportError:
-            # Fallback: try using standard transformers if custom import fails
-            print("Custom RadFM import failed, trying standard transformers...")
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                str(self.model_path),
-                trust_remote_code=True,
-            )
-
-            self.model = AutoModelForCausalLM.from_pretrained(
-                str(self.model_path),
-                torch_dtype=self.dtype,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-            self.model.eval()
+        except ImportError as e:
+            print(f"Failed to import RadFM model: {e}")
+            print("Make sure external/RadFM/Quick_demo exists with Model/RadFM/multimodality_model.py")
+            raise
 
         finally:
             # Remove path from sys.path
-            if str(self.model_path) in sys.path:
-                sys.path.remove(str(self.model_path))
+            if str(external_path) in sys.path:
+                sys.path.remove(str(external_path))
 
         self._loaded = True
         print("RadFM model loaded successfully!")
@@ -198,20 +191,16 @@ class RadFMModel(Medical3DModel):
             del self.tokenizer
             self.tokenizer = None
 
+        if hasattr(self, 'image_padding_tokens'):
+            del self.image_padding_tokens
+            self.image_padding_tokens = None
+
         self._loaded = False
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         print("RadFM model unloaded.")
-
-    def _format_prompt_with_image(self, question: str) -> str:
-        """
-        Format prompt with image placeholder tokens.
-
-        RadFM uses <image></image> tags to mark image positions.
-        """
-        return f"<image></image>{question}"
 
     def generate_response(
         self,
@@ -232,38 +221,35 @@ class RadFMModel(Medical3DModel):
         """
         self.ensure_loaded()
 
-        # Prepare image tensor
-        image_tensor = self.preprocess_tensor(image, modality)
+        # Prepare image tensor in RadFM format (B, S, C, H, W, D)
+        vision_x = self.preprocess_tensor(image, modality)
 
-        # Format prompt with image markers
-        prompt = self._format_prompt_with_image(question)
+        # Format prompt with image placeholder tokens using helper
+        prompt = format_prompt_with_image(
+            question,
+            self.image_padding_tokens,
+            image_index=0,
+            position=0  # Prepend image before question
+        )
 
-        # Tokenize
-        inputs = self.tokenizer(
+        # Tokenize the prompt
+        lang_x = self.tokenizer(
             prompt,
-            return_tensors="pt",
             max_length=2048,
             truncation=True,
-        ).to(self.device)
+            return_tensors="pt"
+        )['input_ids'].to(self.device)
 
         with torch.no_grad():
-            # RadFM generate
-            outputs = self.model.generate(
-                input_ids=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
-                images=image_tensor,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-            )
+            # RadFM generate uses positional args: model.generate(lang_x, vision_x)
+            generation = self.model.generate(lang_x, vision_x)
 
         # Decode response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = self.tokenizer.batch_decode(generation, skip_special_tokens=True)[0]
 
-        # Remove prompt from response
-        if prompt in response:
-            response = response.replace(prompt, "")
+        # Remove the question from response if present
+        if question in response:
+            response = response.replace(question, "").strip()
 
         return response.strip()
 

@@ -49,6 +49,8 @@ MODEL_CONFIGS = {
             {"name": "pytorch_model.zip", "is_split": False},  # Single archive
         ],
         "extract_required": True,
+        "language_files_source": "external/RadFM/Quick_demo/Language_files",
+        "note_language_files": "Language_files (LLaMA tokenizer) copied from external repo, not HuggingFace",
     },
     "ct-clip": {
         "repo_id": "ibrahimethemhamamci/CT-CLIP",  # May need to be updated
@@ -179,6 +181,73 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
     return success
 
 
+def copy_radfm_language_files(target_dir: Path) -> bool:
+    """
+    Copy RadFM Language_files from external repo.
+
+    RadFM requires Language_files (LLaMA tokenizer config) which are not
+    available on HuggingFace. These files are copied from the external/RadFM
+    repository cloned locally.
+
+    Args:
+        target_dir: RadFM model directory (e.g., models/RadFM)
+
+    Returns:
+        True if copy successful
+    """
+    # Source path: external/RadFM/Quick_demo/Language_files
+    source_dir = Path(__file__).parent.parent / "external" / "RadFM" / "Quick_demo" / "Language_files"
+
+    # Target path: models/RadFM/Language_files
+    target_lang_dir = target_dir / "Language_files"
+
+    # Check if source exists
+    if not source_dir.exists():
+        print(f"  Warning: Language_files source not found at {source_dir}")
+        print(f"  RadFM requires Language_files to be copied from external repo")
+        print(f"  Expected location: external/RadFM/Quick_demo/Language_files")
+        return False
+
+    # Create target directory
+    target_lang_dir.mkdir(parents=True, exist_ok=True)
+
+    # Files to copy
+    required_files = [
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+    ]
+
+    print(f"  Copying Language_files from external repo...")
+    print(f"    Source: {source_dir}")
+    print(f"    Target: {target_lang_dir}")
+
+    try:
+        copied_count = 0
+        for filename in required_files:
+            source_file = source_dir / filename
+            target_file = target_lang_dir / filename
+
+            if source_file.exists():
+                shutil.copy2(source_file, target_file)
+                print(f"    Copied {filename}")
+                copied_count += 1
+            else:
+                print(f"    Warning: {filename} not found in source")
+
+        if copied_count == len(required_files):
+            print(f"  Language_files copied successfully ({copied_count}/{len(required_files)} files)")
+            return True
+        else:
+            print(f"  Warning: Only {copied_count}/{len(required_files)} files copied")
+            return False
+
+    except Exception as e:
+        print(f"  Error copying Language_files: {e}")
+        return False
+
+
 def download_model(
     model_name: str,
     model_dir: Path,
@@ -244,6 +313,13 @@ def download_model(
                     local_dir=str(model_dir),
                 )
                 print(f"    Downloaded {extra['filename']}")
+
+        # Copy Language_files for RadFM (before extraction)
+        if model_name == "radfm" and config.get("language_files_source"):
+            print()
+            copy_success = copy_radfm_language_files(target_dir)
+            if not copy_success:
+                print("  Warning: Language_files copy failed. RadFM may not work correctly.")
 
         # Handle extraction for RadFM
         if config.get("extract_required"):
@@ -326,6 +402,8 @@ def list_models():
         print(f"    HuggingFace: {config['repo_id']}")
         if config.get("note"):
             print(f"    Note: {config['note']}")
+        if config.get("note_language_files"):
+            print(f"    Note: {config['note_language_files']}")
     print()
 
 

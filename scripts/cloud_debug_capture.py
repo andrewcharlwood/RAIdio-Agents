@@ -823,6 +823,276 @@ def capture_med3dvlm_debug(
     return result
 
 
+def capture_radfm_debug(
+    dicom_path: Optional[str],
+    question: str = "What anatomical structures are visible in this scan?",
+    modality: str = "CT",
+    use_synthetic: bool = False,
+) -> Dict[str, Any]:
+    """
+    Capture RadFM internals for debugging.
+
+    Returns detailed info about:
+    - Model loading from Language_files
+    - Tokenizer special token count (should be 3202+ with image tokens)
+    - Image tensor shape (should be (B, S, C, H, W, D) with D=depth as LAST dim)
+    - Prompt format with <image></image> markers
+    - Generation attempt and response
+    """
+    result = {
+        "model": "radfm",
+        "status": "error",
+        "error": None,
+        "debug_data": {},
+    }
+
+    try:
+        project_root = Path(__file__).parent.parent
+        model_path = project_root / "models" / "RadFM"
+
+        # Check both possible locations for Language_files
+        language_files_paths = [
+            model_path / "Language_files",
+            project_root / "external" / "RadFM" / "Quick_demo" / "Language_files",
+        ]
+
+        language_files_path = None
+        for path in language_files_paths:
+            if path.exists():
+                language_files_path = path
+                break
+
+        result["debug_data"]["paths"] = {
+            "model_path": str(model_path),
+            "model_path_exists": model_path.exists(),
+            "language_files_path": str(language_files_path) if language_files_path else None,
+            "language_files_exists": language_files_path.exists() if language_files_path else False,
+            "pytorch_model_bin_exists": (model_path / "pytorch_model.bin").exists() if model_path.exists() else False,
+        }
+
+        if not model_path.exists():
+            result["error"] = f"Model path not found at {model_path}"
+            return result
+
+        if not language_files_path:
+            result["error"] = "Language_files directory not found in any expected location"
+            return result
+
+        # Import RadFM's custom tokenizer function
+        import sys
+        radfm_root = project_root / "external" / "RadFM" / "Quick_demo"
+        if str(radfm_root) not in sys.path:
+            sys.path.insert(0, str(radfm_root))
+
+        try:
+            from transformers import LlamaTokenizer
+
+            # RadFM tokenizer constants
+            MAX_IMG_SIZE = 100  # Maximum number of images
+            IMAGE_NUM = 32  # Tokens per image
+
+            print("Loading RadFM tokenizer...")
+            # Replicate get_tokenizer function from test.py
+            image_padding_tokens = []
+            tokenizer = LlamaTokenizer.from_pretrained(str(language_files_path))
+
+            special_token = {"additional_special_tokens": ["<image>", "</image>"]}
+
+            # Generate image tokens
+            for i in range(MAX_IMG_SIZE):
+                image_padding_token = ""
+                for j in range(IMAGE_NUM):
+                    image_token = f"<image{i * IMAGE_NUM + j}>"
+                    image_padding_token += image_token
+                    special_token["additional_special_tokens"].append(image_token)
+                image_padding_tokens.append(image_padding_token)
+                tokenizer.add_special_tokens(special_token)
+
+            # Configure LLaMA special tokens
+            tokenizer.pad_token_id = 0
+            tokenizer.bos_token_id = 1
+            tokenizer.eos_token_id = 2
+
+            vocab_size = len(tokenizer)
+
+            result["debug_data"]["tokenizer"] = {
+                "vocab_size": vocab_size,
+                "expected_min_size": 32000 + (MAX_IMG_SIZE * IMAGE_NUM) + 2,  # LLaMA base + image tokens + markers
+                "image_tokens_per_image": IMAGE_NUM,
+                "max_images_supported": MAX_IMG_SIZE,
+                "has_image_start_token": "<image>" in tokenizer.get_vocab(),
+                "has_image_end_token": "</image>" in tokenizer.get_vocab(),
+                "image_token_0_id": tokenizer.convert_tokens_to_ids("<image0>") if "<image0>" in tokenizer.get_vocab() else None,
+                "first_image_padding": image_padding_tokens[0][:50] + "..." if image_padding_tokens else None,
+            }
+
+            # Create image tensor
+            # RadFM expects: (B, S, C, H, W, D) where D is DEPTH (last dimension)
+            # S = number of images in sequence
+            # For 2D images: D=4 (as per test.py)
+            # For 3D CT: D can be variable
+
+            if use_synthetic or dicom_path is None:
+                print("Using synthetic test volume...")
+                # Create synthetic 3D volume: (1, 1, 3, 512, 512, 4)
+                # B=1, S=1, C=3 (RGB), H=512, W=512, D=4
+                image_tensor = torch.randn(1, 1, 3, 512, 512, 4, dtype=torch.float32)
+                result["debug_data"]["preprocessing"] = {"synthetic": True}
+            else:
+                import SimpleITK as sitk
+                from scipy.ndimage import zoom
+
+                print(f"Loading DICOM from {dicom_path}...")
+                reader = sitk.ImageSeriesReader()
+                dicom_files = reader.GetGDCMSeriesFileNames(dicom_path)
+
+                if not dicom_files:
+                    result["error"] = "No DICOM files found"
+                    return result
+
+                reader.SetFileNames(dicom_files)
+                image = reader.Execute()
+                array = sitk.GetArrayFromImage(image)  # (Z, Y, X)
+
+                result["debug_data"]["preprocessing"] = {
+                    "dicom_file_count": len(dicom_files),
+                    "raw_array_shape": list(array.shape),
+                    "raw_spacing": list(image.GetSpacing()),
+                }
+
+                # Apply CT windowing if CT
+                if modality == "CT":
+                    # Soft tissue window
+                    window_center = 40
+                    window_width = 350
+                    min_val = window_center - window_width / 2
+                    max_val = window_center + window_width / 2
+                    array = np.clip(array, min_val, max_val)
+                    array = (array - min_val) / (max_val - min_val)
+                else:
+                    # MRI: normalize
+                    array = (array - array.min()) / (array.max() - array.min() + 1e-8)
+
+                # Resize to 512x512x4 (typical RadFM 2D-like dimensions)
+                target_shape = (4, 512, 512)  # (D, H, W)
+                if array.shape != target_shape:
+                    zoom_factors = tuple(t / c for t, c in zip(target_shape, array.shape))
+                    array = zoom(array, zoom_factors, order=1)
+
+                # Convert to RGB by repeating channels: (D, H, W) -> (C, H, W, D)
+                # RadFM expects (C, H, W, D) per image
+                array = array.transpose(1, 2, 0)  # (H, W, D)
+                array = np.stack([array, array, array], axis=0)  # (3, H, W, D)
+
+                # Add batch and sequence dims: (B, S, C, H, W, D)
+                image_tensor = torch.from_numpy(array[np.newaxis, np.newaxis, ...]).to(dtype=torch.float32)
+
+            result["debug_data"]["image_tensor"] = {
+                "shape": list(image_tensor.shape),
+                "expected_format": "[B, S, C, H, W, D] where D=depth (LAST)",
+                "expected_shape_example": [1, 1, 3, 512, 512, 4],
+                "depth_is_last": True,  # RadFM uses D as last dimension
+                "dtype": str(image_tensor.dtype),
+                "channels": image_tensor.shape[2] if image_tensor.ndim >= 3 else None,
+                "expected_channels": 3,  # RGB
+            }
+
+            # Build prompt with image markers
+            # Format: <image><image0><image1>...<image31></image>question
+            prompt_with_image = f"<image>{image_padding_tokens[0]}</image>{question}"
+
+            result["debug_data"]["prompt_format"] = {
+                "format": "<image>[32 image tokens]</image>question",
+                "image_tokens_count": IMAGE_NUM,
+                "prompt_sample": prompt_with_image[:100] + "...",
+                "prompt_length": len(prompt_with_image),
+            }
+
+            # Try to load model and generate
+            try:
+                from Model.RadFM.multimodality_model import MultiLLaMAForCausalLM
+
+                print("Loading RadFM model...")
+                model = MultiLLaMAForCausalLM(
+                    lang_model_path=str(language_files_path),
+                )
+
+                # Try to load checkpoint
+                ckpt_path = model_path / "pytorch_model.bin"
+                if ckpt_path.exists():
+                    print(f"Loading checkpoint from {ckpt_path}...")
+                    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+                    model.load_state_dict(ckpt)
+                    result["debug_data"]["model_loading"] = {
+                        "checkpoint_loaded": True,
+                        "checkpoint_path": str(ckpt_path),
+                    }
+                else:
+                    result["debug_data"]["model_loading"] = {
+                        "checkpoint_loaded": False,
+                        "warning": f"Checkpoint not found at {ckpt_path}",
+                    }
+
+                model = model.to("cuda")
+                model.eval()
+
+                # Tokenize prompt
+                print("Running generation...")
+                lang_x = tokenizer(
+                    prompt_with_image,
+                    max_length=2048,
+                    truncation=True,
+                    return_tensors="pt"
+                )['input_ids'].to('cuda')
+
+                vision_x = image_tensor.to('cuda')
+
+                input_len = lang_x.shape[1]
+
+                # Generate (using positional args like test.py)
+                with torch.no_grad():
+                    generation = model.generate(lang_x, vision_x)
+
+                # Decode response
+                response = tokenizer.batch_decode(generation, skip_special_tokens=True)[0]
+
+                result["debug_data"]["generation"] = {
+                    "input_length": input_len,
+                    "output_length": generation.shape[1],
+                    "new_tokens_count": generation.shape[1] - input_len,
+                    "generation_method": "model.generate(lang_x, vision_x)",  # Positional args
+                }
+
+                result["debug_data"]["response"] = {
+                    "raw_response": response.strip(),
+                    "response_length": len(response),
+                    "is_empty": len(response.strip()) == 0,
+                }
+
+                # Cleanup
+                del model
+                torch.cuda.empty_cache()
+
+                result["status"] = "success"
+
+            except ImportError as e:
+                result["debug_data"]["model_loading"] = {
+                    "error": f"Failed to import RadFM model: {str(e)}",
+                    "suggestion": "Ensure RadFM repository is cloned to external/RadFM",
+                }
+                result["status"] = "partial_success"  # Tokenizer worked
+
+        finally:
+            if str(radfm_root) in sys.path:
+                sys.path.remove(str(radfm_root))
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["traceback"] = traceback.format_exc()
+
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cloud Debug Capture Script")
     parser.add_argument(
@@ -845,7 +1115,7 @@ def main():
     parser.add_argument(
         "--models",
         type=str,
-        default="m3d-lamed,vila-m3,med3dvlm",
+        default="m3d-lamed,vila-m3,med3dvlm,radfm",
         help="Comma-separated list of models to test (default: all)",
     )
     parser.add_argument(
@@ -896,21 +1166,34 @@ def main():
     }
 
     # Run captures
+    model_count = len(models_to_test)
+    current = 0
+
     if "m3d-lamed" in models_to_test:
-        print("\n[1/3] Capturing M3D-LaMed debug data...")
+        current += 1
+        print(f"\n[{current}/{model_count}] Capturing M3D-LaMed debug data...")
         results["models"]["m3d-lamed"] = capture_m3d_lamed_debug(
             args.dicom_path, args.question, args.modality, use_synthetic
         )
 
     if "vila-m3" in models_to_test:
-        print("\n[2/3] Capturing VILA-M3 debug data...")
+        current += 1
+        print(f"\n[{current}/{model_count}] Capturing VILA-M3 debug data...")
         results["models"]["vila-m3"] = capture_vila_m3_debug(
             args.dicom_path, args.question, args.modality, use_synthetic
         )
 
     if "med3dvlm" in models_to_test:
-        print("\n[3/3] Capturing Med3DVLM debug data...")
+        current += 1
+        print(f"\n[{current}/{model_count}] Capturing Med3DVLM debug data...")
         results["models"]["med3dvlm"] = capture_med3dvlm_debug(
+            args.dicom_path, args.question, args.modality, use_synthetic
+        )
+
+    if "radfm" in models_to_test:
+        current += 1
+        print(f"\n[{current}/{model_count}] Capturing RadFM debug data...")
+        results["models"]["radfm"] = capture_radfm_debug(
             args.dicom_path, args.question, args.modality, use_synthetic
         )
 
@@ -955,6 +1238,25 @@ def main():
                 resp_data = debug.get("response", {})
                 print(f"  - Response is empty: {resp_data.get('is_empty', 'N/A')}")
                 print(f"  - Working param name: {resp_data.get('working_param_name', 'N/A')}")
+
+            elif model_name == "radfm":
+                paths_data = debug.get("paths", {})
+                print(f"  - Language_files found: {paths_data.get('language_files_exists', 'N/A')}")
+                print(f"  - pytorch_model.bin exists: {paths_data.get('pytorch_model_bin_exists', 'N/A')}")
+
+                tokenizer_data = debug.get("tokenizer", {})
+                if tokenizer_data:
+                    print(f"  - Vocab size: {tokenizer_data.get('vocab_size', 'N/A')}")
+                    print(f"  - Image tokens per image: {tokenizer_data.get('image_tokens_per_image', 'N/A')}")
+
+                tensor_data = debug.get("image_tensor", {})
+                if tensor_data:
+                    print(f"  - Tensor shape: {tensor_data.get('shape', 'N/A')}")
+                    print(f"  - Depth is last dim: {tensor_data.get('depth_is_last', 'N/A')}")
+
+                resp_data = debug.get("response", {})
+                if resp_data:
+                    print(f"  - Response is empty: {resp_data.get('is_empty', 'N/A')}")
 
         elif model_result.get("error"):
             print(f"  - Error: {model_result['error'][:100]}...")
