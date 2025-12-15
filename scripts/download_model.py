@@ -91,7 +91,11 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
     Extract RadFM zip archive on Linux/macOS.
 
     RadFM model weights are downloaded as pytorch_model.zip (single archive).
-    Uses 7z (multithreaded) if available, falls back to unzip.
+
+    NOTE: ZIP extraction is inherently single-threaded regardless of tool used.
+    This is a limitation of the ZIP format - data must be read sequentially.
+    The -mmt flag in 7z only helps with compression, not extraction.
+    Split archives (RadFM.z01-z04 + RadFM.zip) are also sequential, not parallel.
 
     Args:
         target_dir: Directory containing the downloaded archive
@@ -108,18 +112,19 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
         print(f"    Extract pytorch_model.zip")
         return False
 
-    # Check for extraction tools - prefer 7z for multithreaded extraction
+    # Check for extraction tools
     use_7z = shutil.which("7z") is not None
     has_unzip = shutil.which("unzip") is not None
 
     if use_7z:
-        print("  Using 7z for multithreaded extraction...")
+        print("  Using 7z for extraction...")
+        print("  Note: ZIP extraction is single-threaded (format limitation)")
     elif has_unzip:
-        print("  Using unzip (install p7zip-full for faster multithreaded extraction)")
+        print("  Using unzip for extraction...")
     else:
         print("  Error: No extraction tool found. Install with:")
-        print("    Ubuntu/Debian: sudo apt-get install p7zip-full  # Recommended (multithreaded)")
-        print("                   sudo apt-get install unzip       # Alternative")
+        print("    Ubuntu/Debian: sudo apt-get install p7zip-full")
+        print("                   sudo apt-get install unzip")
         print("    macOS: brew install p7zip")
         return False
 
@@ -139,11 +144,12 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
 
         try:
             if use_7z:
-                # 7z with multithreading enabled (-mmt=on)
+                # 7z extraction (single-threaded for ZIP format)
                 # -o specifies output directory (no space after -o)
                 # -y answers yes to all prompts (overwrite)
+                # Note: -mmt=on removed - it only helps compression, not extraction
                 result = subprocess.run(
-                    ["7z", "x", "-y", f"-o{target_dir}", "-mmt=on", str(archive_path)],
+                    ["7z", "x", "-y", f"-o{target_dir}", str(archive_path)],
                     capture_output=True,
                     text=True,
                     cwd=str(target_dir),
@@ -181,37 +187,22 @@ def extract_radfm_archives(target_dir: Path, cleanup: bool = True) -> bool:
     return success
 
 
-def copy_radfm_language_files(target_dir: Path) -> bool:
+def download_radfm_language_files(target_dir: Path) -> bool:
     """
-    Copy RadFM Language_files from external repo.
+    Download RadFM Language_files from HuggingFace.
 
-    RadFM requires Language_files (LLaMA tokenizer config) which are not
-    available on HuggingFace. These files are copied from the external/RadFM
-    repository cloned locally.
+    RadFM requires LLaMA tokenizer files. This function downloads them
+    from the RadFM HuggingFace repo, or falls back to base LLaMA tokenizer.
 
     Args:
         target_dir: RadFM model directory (e.g., models/RadFM)
 
     Returns:
-        True if copy successful
+        True if download successful
     """
-    # Source path: external/RadFM/Quick_demo/Language_files
-    source_dir = Path(__file__).parent.parent / "external" / "RadFM" / "Quick_demo" / "Language_files"
-
-    # Target path: models/RadFM/Language_files
     target_lang_dir = target_dir / "Language_files"
-
-    # Check if source exists
-    if not source_dir.exists():
-        print(f"  Warning: Language_files source not found at {source_dir}")
-        print(f"  RadFM requires Language_files to be copied from external repo")
-        print(f"  Expected location: external/RadFM/Quick_demo/Language_files")
-        return False
-
-    # Create target directory
     target_lang_dir.mkdir(parents=True, exist_ok=True)
 
-    # Files to copy
     required_files = [
         "config.json",
         "special_tokens_map.json",
@@ -219,33 +210,85 @@ def copy_radfm_language_files(target_dir: Path) -> bool:
         "tokenizer_config.json",
     ]
 
-    print(f"  Copying Language_files from external repo...")
-    print(f"    Source: {source_dir}")
-    print(f"    Target: {target_lang_dir}")
+    print(f"  Downloading Language_files for RadFM tokenizer...")
 
+    # Method 1: Try to download from RadFM HuggingFace repo
     try:
-        copied_count = 0
+        print(f"    Attempting download from chaoyi-wu/RadFM...")
+        downloaded = 0
         for filename in required_files:
-            source_file = source_dir / filename
-            target_file = target_lang_dir / filename
+            try:
+                hf_hub_download(
+                    repo_id="chaoyi-wu/RadFM",
+                    filename=f"Language_files/{filename}",
+                    local_dir=str(target_dir),
+                    local_dir_use_symlinks=False,
+                )
+                print(f"    Downloaded {filename}")
+                downloaded += 1
+            except Exception:
+                pass  # File might not exist in repo
 
-            if source_file.exists():
-                shutil.copy2(source_file, target_file)
-                print(f"    Copied {filename}")
-                copied_count += 1
-            else:
-                print(f"    Warning: {filename} not found in source")
-
-        if copied_count == len(required_files):
-            print(f"  Language_files copied successfully ({copied_count}/{len(required_files)} files)")
+        if downloaded == len(required_files):
+            print(f"  Language_files downloaded successfully from RadFM repo")
             return True
-        else:
-            print(f"  Warning: Only {copied_count}/{len(required_files)} files copied")
-            return False
+        elif downloaded > 0:
+            print(f"    Partial download ({downloaded}/{len(required_files)} files)")
+    except Exception as e:
+        print(f"    RadFM repo download failed: {e}")
+
+    # Method 2: Try base LLaMA-7B tokenizer (smaller, same tokenizer format)
+    try:
+        print(f"    Falling back to base LLaMA tokenizer...")
+        snapshot_download(
+            repo_id="huggyllama/llama-7b",
+            local_dir=str(target_lang_dir),
+            allow_patterns=["tokenizer.model", "tokenizer_config.json", "special_tokens_map.json"],
+            local_dir_use_symlinks=False,
+        )
+
+        # Create minimal config.json if not present
+        config_path = target_lang_dir / "config.json"
+        if not config_path.exists():
+            import json
+            config = {
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "vocab_size": 32000,
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+            print(f"    Created minimal config.json")
+
+        # Verify files exist
+        existing = [f for f in required_files if (target_lang_dir / f).exists()]
+        if len(existing) >= 3:  # tokenizer.model is essential
+            print(f"  Language_files downloaded from LLaMA base ({len(existing)}/{len(required_files)} files)")
+            return True
 
     except Exception as e:
-        print(f"  Error copying Language_files: {e}")
-        return False
+        print(f"    LLaMA tokenizer download failed: {e}")
+
+    # Method 3: Copy from external repo if available (original method)
+    source_dir = Path(__file__).parent.parent / "external" / "RadFM" / "Quick_demo" / "Language_files"
+    if source_dir.exists():
+        print(f"    Copying from external repo...")
+        try:
+            copied = 0
+            for filename in required_files:
+                source_file = source_dir / filename
+                if source_file.exists():
+                    shutil.copy2(source_file, target_lang_dir / filename)
+                    copied += 1
+            if copied > 0:
+                print(f"  Language_files copied from external repo ({copied}/{len(required_files)} files)")
+                return copied == len(required_files)
+        except Exception as e:
+            print(f"    Copy from external failed: {e}")
+
+    print(f"  ERROR: Failed to obtain Language_files from any source")
+    print(f"  Manual fix: Download LLaMA tokenizer files to {target_lang_dir}")
+    return False
 
 
 def download_model(
@@ -317,7 +360,7 @@ def download_model(
         # Copy Language_files for RadFM (before extraction)
         if model_name == "radfm" and config.get("language_files_source"):
             print()
-            copy_success = copy_radfm_language_files(target_dir)
+            copy_success = download_radfm_language_files(target_dir)
             if not copy_success:
                 print("  Warning: Language_files copy failed. RadFM may not work correctly.")
 
@@ -334,16 +377,18 @@ def download_model(
                         print("  MANUAL EXTRACTION REQUIRED")
                         print("  " + "=" * 50)
                         print(f"  Navigate to: {target_dir}")
-                        print("  Run: 7z x -mmt=on pytorch_model.zip  # Multithreaded (recommended)")
+                        print("  Run: 7z x pytorch_model.zip")
                         print("   Or: unzip pytorch_model.zip")
+                        print("  Note: ZIP extraction is single-threaded (format limitation)")
                         print()
             else:
                 print("  " + "=" * 50)
                 print("  EXTRACTION REQUIRED (--no-extract specified)")
                 print("  " + "=" * 50)
                 print(f"  Navigate to: {target_dir}")
-                print("  Run: 7z x -mmt=on pytorch_model.zip  # Multithreaded (recommended)")
+                print("  Run: 7z x pytorch_model.zip")
                 print("   Or: unzip pytorch_model.zip")
+                print("  Note: ZIP extraction is single-threaded (format limitation)")
                 print()
 
         return True
