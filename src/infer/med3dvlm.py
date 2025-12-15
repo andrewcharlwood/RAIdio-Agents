@@ -213,6 +213,10 @@ class Med3DVLMModel(Medical3DModel):
         """
         Generate a response for a question about an image.
 
+        Med3DVLM uses the same prompt format as M3D-LaMed:
+        - 256 <im_patch> tokens (image placeholder)
+        - followed by the question text
+
         Args:
             image: DICOM path, preprocessed array, or tensor
             question: Question to ask about the image
@@ -226,48 +230,42 @@ class Med3DVLMModel(Medical3DModel):
         # Prepare image tensor (includes shape validation)
         image_tensor = self.preprocess_tensor(image, modality)
 
-        # Tokenize the question
+        # Get proj_out_num from model config (number of image tokens)
+        # Default is 256 based on demo.py
+        try:
+            proj_out_num = self.model.get_model().config.proj_out_num
+        except (AttributeError, TypeError):
+            proj_out_num = 256
+
+        # Build prompt with image tokens (same format as M3D-LaMed)
+        # Format: <im_patch> * 256 + question
+        image_tokens = "<im_patch>" * proj_out_num
+        prompt = image_tokens + question
+
+        # Tokenize the full prompt (image tokens + question)
         inputs = self.tokenizer(
-            question,
+            prompt,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=1024,
         ).to(self.device)
 
-        # Med3DVLM may use different parameter names for image input
-        # Try 'images' first (most likely), fall back to 'pixel_values'
+        # Generation parameters
         generation_kwargs = {
-            "attention_mask": inputs.attention_mask,
             "max_new_tokens": self.max_new_tokens,
-            "temperature": 0.7,  # Lowered from 1.0 for more coherent output
+            "temperature": 0.7,
             "do_sample": True,
             "top_p": 0.9,
         }
 
         with torch.no_grad():
-            try:
-                # Attempt 1: Use 'images' and 'inputs' parameters
-                outputs = self.model.generate(
-                    images=image_tensor,
-                    inputs=inputs.input_ids,
-                    **generation_kwargs,
-                )
-            except TypeError:
-                try:
-                    # Attempt 2: Use 'pixel_values' and 'input_ids' parameters
-                    outputs = self.model.generate(
-                        pixel_values=image_tensor,
-                        input_ids=inputs.input_ids,
-                        **generation_kwargs,
-                    )
-                except TypeError:
-                    # Attempt 3: Use positional arguments
-                    outputs = self.model.generate(
-                        image_tensor,
-                        inputs.input_ids,
-                        **generation_kwargs,
-                    )
+            # Med3DVLM expects 'images' and 'inputs' parameters
+            outputs = self.model.generate(
+                images=image_tensor,
+                inputs=inputs.input_ids,
+                **generation_kwargs,
+            )
 
         # Decode response
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -280,7 +278,6 @@ class Med3DVLMModel(Medical3DModel):
 
         # Check for common error indicators
         if response in ["?", "", "."]:
-            # Return a more informative message instead of cryptic output
             return "(Model produced no meaningful response - possible input format issue)"
 
         return response

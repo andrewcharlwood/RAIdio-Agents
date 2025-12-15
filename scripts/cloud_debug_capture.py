@@ -514,18 +514,36 @@ def capture_med3dvlm_debug(
             "device": str(image_tensor.device),
         }
 
-        # Tokenize question
+        # Get proj_out_num from model config (number of image tokens)
+        try:
+            proj_out_num = model.get_model().config.proj_out_num
+        except (AttributeError, TypeError):
+            proj_out_num = 256
+
+        # Build prompt with image tokens (same format as M3D-LaMed)
+        # Format: <im_patch> * proj_out_num + question
+        image_tokens = "<im_patch>" * proj_out_num
+        prompt = image_tokens + question
+
+        # Tokenize the full prompt (image tokens + question)
         inputs = tokenizer(
-            question,
+            prompt,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=1024,
         ).to("cuda")
 
+        result["debug_data"]["prompt_format"] = {
+            "proj_out_num": proj_out_num,
+            "image_tokens_count": proj_out_num,
+            "prompt_length": len(prompt),
+        }
+
         result["debug_data"]["tokenizer"] = {
             "input_length": inputs.input_ids.shape[1],
             "input_ids_sample": inputs.input_ids[0][:20].tolist(),
+            "expected_min_length": proj_out_num + 5,  # image tokens + question tokens
         }
 
         # Run generation
