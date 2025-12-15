@@ -17,6 +17,14 @@ import torch
 
 # Import the new model system
 from .infer import get_model, list_models
+
+# Patient context support
+from .patient_context import (
+    PatientContext,
+    load_patient_context,
+    enhance_question_with_context,
+    build_clinical_context_string,
+)
 from .infer.m3d_lamed import M3DLaMedModel, DEFAULT_ANALYSIS_QUESTIONS
 
 # Re-export for backwards compatibility

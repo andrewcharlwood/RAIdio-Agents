@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import traceback
 from datetime import datetime
@@ -20,6 +21,18 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+
+
+# Med3DVLM cleaning patterns (from med3dvlm.py)
+BOUNDING_BOX_PATTERN = re.compile(r'\[\s*[\d.]+(?:\s*,\s*[\d.]+)*\s*\]')
+CONVERSATIONAL_PREFIXES = [
+    "Sure, it is ", "Sure, ", "Certainly, ", "Of course, ",
+    "The answer is ", "Based on the image, ", "Looking at the image, ",
+]
+VQA_PATTERNS = [
+    r'^(?:The\s+)?(?:answer|response)\s+(?:is|would be)[:\s]+',
+    r'^(?:It\s+)?(?:appears|looks|seems)\s+(?:to be|like)[:\s]+',
+]
 
 
 def capture_m3d_lamed_debug(
@@ -379,19 +392,36 @@ def capture_vila_m3_debug(
                 "image_path": image_path,
             }
 
+        # MODEL_CARDS: Expert model descriptions (required for proper model behavior)
+        # The VILA-M3 model was trained with this context and expects it in the prompt
+        MODEL_CARDS = """Here is a list of available expert models:
+<BRATS(args)> Modality: MRI, Task: segmentation, Overview: A pre-trained model for volumetric (3D) segmentation of brain tumor subregions from multimodal MRIs based on BraTS 2018 data, Accuracy: Tumor core (TC): 0.8559 - Whole tumor (WT): 0.9026 - Enhancing tumor (ET): 0.7905 - Average: 0.8518, Valid args are: None
+<VISTA3D(args)> Modality: CT, Task: segmentation, Overview: domain-specialized interactive foundation model developed for segmenting and annotating human anatomies with precision, Accuracy: 127 organs: 0.792 Dice on average, Valid args are: 'everything', 'hepatic tumor', 'pancreatic tumor', 'lung tumor', 'bone lesion', 'organs', 'cardiovascular', 'gastrointestinal', 'skeleton', or 'muscles'
+<VISTA2D(args)> Modality: cell imaging, Task: segmentation, Overview: model for cell segmentation, which was trained on a variety of cell imaging outputs, including brightfield, phase-contrast, fluorescence, confocal, or electron microscopy, Accuracy: Good accuracy across several cell imaging datasets, Valid args are: None
+<CXR(args)> Modality: chest x-ray (CXR), Task: classification, Overview: pre-trained model which are trained on large cohorts of data, Accuracy: Good accuracy across several diverse chest x-rays datasets, Valid args are: None
+Give the model <NAME(args)> when selecting a suitable expert model.
+"""
+
+        # Build prompt following original VILA-M3 format (gradio_m3.py lines 427-438):
+        # model_cards + "<image>" + mod_msg + prompt
+        mod_msg = f"This is a {modality} image.\n"
+        prompt_text = f"{MODEL_CARDS}<image>{mod_msg}{question}"
+
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"<image>{question}"},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_path", "image_path": image_path},
                 ]
             }
         ]
 
         result["debug_data"]["message_format"] = {
-            "messages": str(messages),
-            "modality_in_prompt": modality in question,
+            "messages": str(messages)[:500] + "...",  # Truncate for readability
+            "prompt_format": "MODEL_CARDS + <image> + mod_msg + question",
+            "mod_msg": mod_msg.strip(),
+            "has_model_cards": True,
             "modality_passed": modality,
         }
 
@@ -430,6 +460,103 @@ def capture_vila_m3_debug(
         result["traceback"] = traceback.format_exc()
 
     return result
+
+
+def _validate_med3dvlm_prompt(
+    input_ids: torch.Tensor,
+    proj_out_num: int,
+    tokenizer,
+) -> Dict[str, Any]:
+    """
+    Validate that Med3DVLM prompt is in correct simple format (not chat template).
+
+    Checks:
+    - <im_patch> tokens are present and correct count
+    - Tokens are contiguous (not scattered due to chat template)
+
+    Returns dict with validation results for debug output.
+    """
+    result = {
+        "valid": False,
+        "im_patch_count": 0,
+        "expected_count": proj_out_num,
+        "im_patch_positions": [],
+        "is_contiguous": False,
+        "warnings": [],
+    }
+
+    try:
+        # Get <im_patch> token ID
+        im_patch_id = tokenizer.convert_tokens_to_ids("<im_patch>")
+        result["im_patch_token_id"] = im_patch_id
+
+        # Convert to list for analysis
+        ids_list = input_ids[0].tolist() if input_ids.dim() > 1 else input_ids.tolist()
+
+        # Find all positions where <im_patch> appears
+        im_patch_positions = [i for i, tid in enumerate(ids_list) if tid == im_patch_id]
+        result["im_patch_count"] = len(im_patch_positions)
+        result["im_patch_positions"] = im_patch_positions[:10]  # First 10 for brevity
+
+        # Validate count matches proj_out_num
+        if len(im_patch_positions) != proj_out_num:
+            result["warnings"].append(
+                f"Expected {proj_out_num} <im_patch> tokens, found {len(im_patch_positions)}"
+            )
+        else:
+            # Validate contiguity
+            if len(im_patch_positions) >= 2:
+                expected_contiguous = (
+                    im_patch_positions[-1] - im_patch_positions[0] == proj_out_num - 1
+                )
+                result["is_contiguous"] = expected_contiguous
+                if not expected_contiguous:
+                    result["warnings"].append(
+                        "<im_patch> tokens are not contiguous - possible chat template issue"
+                    )
+                else:
+                    result["valid"] = True
+            elif len(im_patch_positions) == 1:
+                result["is_contiguous"] = True
+                result["valid"] = True
+
+    except Exception as e:
+        result["warnings"].append(f"Validation error: {str(e)}")
+
+    return result
+
+
+def _clean_med3dvlm_response(response: str) -> str:
+    """
+    Clean Med3DVLM response by removing artifacts.
+
+    Removes:
+    - Bounding boxes: [0.094, 0.348, ...]
+    - Conversational prefixes: "Sure, it is...", "Certainly, ..."
+    - Extra whitespace
+    """
+    cleaned = response.strip()
+
+    # Remove bounding boxes using regex pattern
+    cleaned = BOUNDING_BOX_PATTERN.sub('', cleaned)
+
+    # Remove conversational prefixes
+    for prefix in CONVERSATIONAL_PREFIXES:
+        if cleaned.lower().startswith(prefix.lower()):
+            cleaned = cleaned[len(prefix):]
+            break
+
+    # Also handle VQA-style patterns
+    for pattern in VQA_PATTERNS:
+        match = re.match(pattern, cleaned, re.IGNORECASE)
+        if match:
+            cleaned = cleaned[match.end():]
+            break
+
+    # Normalize whitespace and strip
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+    return cleaned
 
 
 def capture_med3dvlm_debug(
@@ -515,10 +642,26 @@ def capture_med3dvlm_debug(
         }
 
         # Get proj_out_num from model config (number of image tokens)
+        # Try multiple fallback locations (matching med3dvlm.py)
+        proj_out_num = None
+        proj_out_num_source = "default"
+
         try:
             proj_out_num = model.get_model().config.proj_out_num
+            proj_out_num_source = "model.get_model().config"
         except (AttributeError, TypeError):
+            pass
+
+        if proj_out_num is None:
+            try:
+                proj_out_num = model.config.proj_out_num
+                proj_out_num_source = "model.config"
+            except (AttributeError, TypeError):
+                pass
+
+        if proj_out_num is None:
             proj_out_num = 256
+            proj_out_num_source = "default (256)"
 
         # Build prompt with image tokens (same format as M3D-LaMed)
         # Format: <im_patch> * proj_out_num + question
@@ -536,21 +679,40 @@ def capture_med3dvlm_debug(
 
         result["debug_data"]["prompt_format"] = {
             "proj_out_num": proj_out_num,
+            "proj_out_num_source": proj_out_num_source,
             "image_tokens_count": proj_out_num,
             "prompt_length": len(prompt),
         }
 
+        # Capture input length for proper response extraction
+        input_len = inputs.input_ids.shape[1]
+
         result["debug_data"]["tokenizer"] = {
-            "input_length": inputs.input_ids.shape[1],
+            "input_length": input_len,
             "input_ids_sample": inputs.input_ids[0][:20].tolist(),
             "expected_min_length": proj_out_num + 5,  # image tokens + question tokens
         }
+
+        # Validate prompt format (matching med3dvlm.py _validate_prompt_format)
+        prompt_validation = _validate_med3dvlm_prompt(
+            inputs.input_ids, proj_out_num, tokenizer
+        )
+        result["debug_data"]["prompt_validation"] = prompt_validation
 
         # Run generation
         print("Running Med3DVLM generation...")
 
         # Try different parameter names
         generation_attempts = []
+
+        # Generation parameters (matching med3dvlm.py)
+        generation_kwargs = {
+            "max_new_tokens": 256,
+            "temperature": 1.0,  # Match original Med3DVLM (was 0.7 before fix)
+            "do_sample": True,
+            "top_p": 0.9,
+            "use_cache": True,
+        }
 
         # Attempt 1: Using 'images' parameter
         try:
@@ -559,15 +721,20 @@ def capture_med3dvlm_debug(
                     images=image_tensor,
                     inputs=inputs.input_ids,
                     attention_mask=inputs.attention_mask,
-                    max_new_tokens=256,
-                    temperature=1.0,
-                    do_sample=True,
+                    **generation_kwargs,
                 )
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Extract only new tokens using input_len (matching med3dvlm.py)
+            if outputs.shape[1] > input_len:
+                new_tokens = outputs[0][input_len:]
+                response = tokenizer.decode(new_tokens, skip_special_tokens=True)
+            else:
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
             generation_attempts.append({
                 "param_name": "images",
                 "success": True,
-                "response": response[:200],
+                "response": response[:500],  # Store more for debugging
+                "output_length": outputs.shape[1],
+                "new_tokens_count": outputs.shape[1] - input_len,
             })
         except Exception as e:
             generation_attempts.append({
@@ -583,15 +750,20 @@ def capture_med3dvlm_debug(
                     pixel_values=image_tensor,
                     input_ids=inputs.input_ids,
                     attention_mask=inputs.attention_mask,
-                    max_new_tokens=256,
-                    temperature=1.0,
-                    do_sample=True,
+                    **generation_kwargs,
                 )
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Extract only new tokens using input_len (matching med3dvlm.py)
+            if outputs.shape[1] > input_len:
+                new_tokens = outputs[0][input_len:]
+                response = tokenizer.decode(new_tokens, skip_special_tokens=True)
+            else:
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
             generation_attempts.append({
                 "param_name": "pixel_values",
                 "success": True,
-                "response": response[:200],
+                "response": response[:500],  # Store more for debugging
+                "output_length": outputs.shape[1],
+                "new_tokens_count": outputs.shape[1] - input_len,
             })
         except Exception as e:
             generation_attempts.append({
@@ -605,18 +777,39 @@ def capture_med3dvlm_debug(
         # Find successful attempt
         successful = [a for a in generation_attempts if a.get("success")]
         if successful:
-            response = successful[0]["response"]
+            raw_response = successful[0]["response"]
+
+            # Clean response (matching med3dvlm.py _clean_response)
+            cleaned_response = _clean_med3dvlm_response(raw_response)
+
             result["debug_data"]["response"] = {
-                "raw_response": response,
-                "response_length": len(response),
-                "is_empty": len(response.strip()) == 0,
-                "is_question_mark": response.strip() == "?",
+                "raw_response": raw_response,
+                "cleaned_response": cleaned_response,
+                "was_cleaned": raw_response != cleaned_response,
+                "response_length": len(cleaned_response),
                 "working_param_name": successful[0]["param_name"],
+                "output_length": successful[0].get("output_length"),
+                "new_tokens_count": successful[0].get("new_tokens_count"),
             }
+
+            # Enhanced error detection (matching med3dvlm.py)
+            result["debug_data"]["response_analysis"] = {
+                "is_empty": len(cleaned_response.strip()) == 0,
+                "is_single_char": len(cleaned_response.strip()) <= 1,
+                "is_question_mark": cleaned_response.strip() == "?",
+                "is_error_response": cleaned_response.strip() in ["?", "", "."],
+                "prompt_valid": prompt_validation.get("valid", False),
+            }
+
             result["status"] = "success"
         else:
             result["debug_data"]["response"] = {
                 "error": "No successful generation attempt",
+            }
+            result["debug_data"]["response_analysis"] = {
+                "is_empty": True,
+                "is_error_response": True,
+                "prompt_valid": prompt_validation.get("valid", False),
             }
 
         # Cleanup

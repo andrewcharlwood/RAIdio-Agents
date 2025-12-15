@@ -107,6 +107,94 @@ LOCATION_QUESTIONS = {
 
 
 # =============================================================================
+# TRAINING-ALIGNED TEMPLATES
+# =============================================================================
+# These templates match what M3D-LaMed and Med3DVLM were trained on
+# (based on original repos' prompt_templates.py files)
+
+TRAINING_ALIGNED_TEMPLATES = {
+    "report": [
+        "Can you provide a caption consists of findings for this medical image?",
+        "Describe the findings of the medical image you see.",
+        "What are the findings presented in this medical scan?",
+        "Please write a caption consists of findings for this scan.",
+        "Can you summarize with findings the images presented?",
+        "What is the findings of this image?",
+        "Describe this medical scan with findings.",
+        "Please caption this medical scan with findings.",
+        "Write a radiology report for this image.",
+        "Provide a detailed description of this medical image.",
+        "What can you observe in this medical imaging study?",
+        "Generate a findings report for this scan.",
+    ],
+    "abnormality": [
+        "What is the abnormality type in this image?",
+        "What abnormality is present in this scan?",
+        "What type of abnormality can be observed in the image?",
+        "Identify any abnormalities or pathological findings visible.",
+        "What is the nature of the anomaly found?",
+        "Which abnormality is present?",
+        "Describe any pathological findings you can identify.",
+        "What pathology is visible in this scan?",
+        "Is there any abnormality in this image?",
+        "What lesion or abnormality can you see?",
+        "Please identify the abnormality present.",
+        "What type of pathological finding is shown?",
+    ],
+    "plane": [
+        "What plane is this image in?",
+        "Which plane is displayed in the image?",
+        "In which anatomical plane is this scan acquired?",
+        "What is the imaging plane?",
+        "Identify the plane of this image.",
+        "Which anatomical plane does this represent?",
+        "What plane was used for this acquisition?",
+        "Is this axial, sagittal, or coronal?",
+    ],
+    "phase": [
+        "What is the CT phase of the image?",
+        "What is the CT phase shown in this image?",
+        "What phase of contrast enhancement is this?",
+        "Is this a contrast or non-contrast study?",
+        "What CT phase is this image?",
+        "Which contrast phase is demonstrated?",
+        "Identify the imaging phase.",
+        "What is the phase shown?",
+        "Is this pre-contrast, arterial, venous, or delayed phase?",
+    ],
+}
+
+
+def get_training_aligned_prompt(category: str) -> str:
+    """
+    Get a random training-aligned prompt template from the specified category.
+
+    These templates match what the M3D-LaMed and Med3DVLM models were trained on,
+    which may improve response quality compared to custom prompts.
+
+    Args:
+        category: One of "report", "abnormality", "plane", "phase"
+
+    Returns:
+        Random prompt string from the specified category
+
+    Raises:
+        ValueError: If category is not recognized
+
+    Example:
+        >>> prompt = get_training_aligned_prompt("report")
+        >>> # Returns one of the report generation templates
+    """
+    if category not in TRAINING_ALIGNED_TEMPLATES:
+        raise ValueError(
+            f"Unknown category '{category}'. "
+            f"Valid categories: {list(TRAINING_ALIGNED_TEMPLATES.keys())}"
+        )
+
+    return random.choice(TRAINING_ALIGNED_TEMPLATES[category])
+
+
+# =============================================================================
 # ANALYSIS CHAIN TEMPLATES
 # =============================================================================
 

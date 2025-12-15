@@ -23,6 +23,16 @@ import torch
 from tqdm import tqdm
 
 
+# MODEL_CARDS: Expert model descriptions (required for proper model behavior)
+# The VILA-M3 model was trained with this context and expects it in the prompt
+MODEL_CARDS = """Here is a list of available expert models:
+<BRATS(args)> Modality: MRI, Task: segmentation, Overview: A pre-trained model for volumetric (3D) segmentation of brain tumor subregions from multimodal MRIs based on BraTS 2018 data, Accuracy: Tumor core (TC): 0.8559 - Whole tumor (WT): 0.9026 - Enhancing tumor (ET): 0.7905 - Average: 0.8518, Valid args are: None
+<VISTA3D(args)> Modality: CT, Task: segmentation, Overview: domain-specialized interactive foundation model developed for segmenting and annotating human anatomies with precision, Accuracy: 127 organs: 0.792 Dice on average, Valid args are: 'everything', 'hepatic tumor', 'pancreatic tumor', 'lung tumor', 'bone lesion', 'organs', 'cardiovascular', 'gastrointestinal', 'skeleton', or 'muscles'
+<VISTA2D(args)> Modality: cell imaging, Task: segmentation, Overview: model for cell segmentation, which was trained on a variety of cell imaging outputs, including brightfield, phase-contrast, fluorescence, confocal, or electron microscopy, Accuracy: Good accuracy across several cell imaging datasets, Valid args are: None
+<CXR(args)> Modality: chest x-ray (CXR), Task: classification, Overview: pre-trained model which are trained on large cohorts of data, Accuracy: Good accuracy across several diverse chest x-rays datasets, Valid args are: None
+Give the model <NAME(args)> when selecting a suitable expert model.
+"""
+
 # Patterns for cleaning VISTA3D/expert model output leakage
 VISTA3D_PATTERNS = [
     r'identified by VISTA3D:\s*[^.]*\.',  # "identified by VISTA3D: red: liver, ..."
@@ -521,9 +531,13 @@ class VILAm3Model(Medical3DModel):
         slice_index: Optional[int] = None,
         use_experts: Optional[bool] = None,
         clean_output: bool = True,
+        include_model_cards: bool = True,
     ) -> str:
         """
         Generate a response for a question about an image.
+
+        The prompt format follows the original VILA-M3 implementation:
+        [MODEL_CARDS]<image>This is a {modality} image.\n{question}
 
         Args:
             image: DICOM path, image path, or array
@@ -532,6 +546,7 @@ class VILAm3Model(Medical3DModel):
             slice_index: Specific slice to analyze (for 3D volumes)
             use_experts: Whether to enable expert models (overrides init setting)
             clean_output: If True, clean response to remove expert model artifacts
+            include_model_cards: If True, include MODEL_CARDS context (recommended)
 
         Returns:
             Model's response string
@@ -541,16 +556,22 @@ class VILAm3Model(Medical3DModel):
         # Prepare image (converts to 2D JPG slice for PIL compatibility)
         image_path = self._prepare_image(image, modality, slice_index)
 
-        # Include modality context in the question to reduce confusion
-        modality_context = f"This is a {modality} scan. "
-        question_with_context = f"{modality_context}{question}"
+        # Build prompt following original VILA-M3 format:
+        # model_cards + "<image>" + mod_msg + prompt
+        # This is how gradio_m3.py constructs prompts (lines 427-438)
+        model_cards = MODEL_CARDS if include_model_cards else ""
+        mod_msg = f"This is a {modality} image.\n" if modality != "Unknown" else ""
+
+        # Construct the full text: model_cards + <image> + mod_msg + question
+        # Note: <image> token MUST come before the modality message
+        prompt_text = f"{model_cards}<image>{mod_msg}{question}"
 
         # Build message structure
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"<image>{question_with_context}"},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_path", "image_path": image_path},
                 ]
             }
@@ -599,11 +620,15 @@ class VILAm3Model(Medical3DModel):
         # First, ask the model to trigger VISTA3D
         seg_prompt = f"Please segment the {segmentation_target} in this image using VISTA3D."
 
+        # Use correct prompt format with MODEL_CARDS
+        mod_msg = f"This is a {modality} image.\n" if modality != "Unknown" else ""
+        prompt_text = f"{MODEL_CARDS}<image>{mod_msg}{seg_prompt}"
+
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"<image>{seg_prompt}"},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_path", "image_path": image_path},
                 ]
             }

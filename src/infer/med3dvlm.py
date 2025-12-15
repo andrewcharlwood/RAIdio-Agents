@@ -11,12 +11,39 @@ Features:
 - Supports: VQA, Report Generation, Image-Text Retrieval
 """
 
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from tqdm import tqdm
+
+
+# Regex patterns for cleaning model output (shared with M3D-LaMed)
+# Matches bounding box coordinates like [0.094, 0.348, 0.605, 0.312, 0.715, 0.824]
+BOUNDING_BOX_PATTERN = re.compile(r'\[[\d\.\s,]+\]')
+
+# Conversational prefixes to strip
+CONVERSATIONAL_PREFIXES = [
+    "Sure, ",
+    "Sure,",
+    "Sure. ",
+    "Sure.",
+    "Certainly, ",
+    "Certainly.",
+    "Of course, ",
+    "Of course.",
+    "Yes, ",
+    "Yes.",
+]
+
+# Patterns that indicate VQA-style responses (not clinical reports)
+VQA_PATTERNS = [
+    r"^Sure,?\s*(it is|the|I)",
+    r"^I'm very confident",
+    r"^\d+\.\d+\.",  # Starts with coordinate-like number
+]
 
 from . import register_model
 from .base import Medical3DModel
@@ -204,11 +231,101 @@ class Med3DVLMModel(Medical3DModel):
 
         print("Med3DVLM model unloaded.")
 
+    def _validate_prompt_format(self, input_ids: torch.Tensor, proj_out_num: int) -> bool:
+        """
+        Validate that prompt is in correct simple format (not chat template).
+
+        For Med3DVLM (Qwen-based), validates:
+        - <im_patch> tokens are present and contiguous
+        - Correct number of image patch tokens
+
+        Args:
+            input_ids: Tokenized prompt tensor
+            proj_out_num: Expected number of image patch tokens
+
+        Returns:
+            True if format is valid, False otherwise (with warning printed)
+        """
+        try:
+            im_patch_id = self.tokenizer.convert_tokens_to_ids("<im_patch>")
+        except Exception:
+            # Cannot validate if token not in vocab
+            return True
+
+        ids_list = input_ids[0].tolist()
+
+        # Check <im_patch> tokens are present
+        im_patch_positions = [i for i, tid in enumerate(ids_list) if tid == im_patch_id]
+
+        if len(im_patch_positions) != proj_out_num:
+            print(
+                f"Warning: Prompt format issue - Expected {proj_out_num} <im_patch> tokens, "
+                f"found {len(im_patch_positions)}. Output quality may be affected."
+            )
+            return False
+
+        # Check that im_patch tokens are contiguous
+        if im_patch_positions:
+            expected_contiguous = im_patch_positions[-1] - im_patch_positions[0] == proj_out_num - 1
+            if not expected_contiguous:
+                print(
+                    "Warning: Prompt format issue - <im_patch> tokens are not contiguous. "
+                    "Output quality may be affected."
+                )
+                return False
+
+        return True
+
+    def _clean_response(self, response: str) -> str:
+        """
+        Clean model response by removing artifacts and unwanted patterns.
+
+        Removes:
+        - Bounding box coordinates like [0.094, 0.348, ...]
+        - Conversational prefixes like "Sure, it is..."
+        - Extra whitespace
+
+        Args:
+            response: Raw model response
+
+        Returns:
+            Cleaned response string
+        """
+        cleaned = response.strip()
+
+        # Remove bounding box coordinates
+        cleaned = BOUNDING_BOX_PATTERN.sub('', cleaned)
+
+        # Remove conversational prefixes (case-insensitive for first letter)
+        for prefix in CONVERSATIONAL_PREFIXES:
+            if cleaned.lower().startswith(prefix.lower()):
+                cleaned = cleaned[len(prefix):]
+                break
+
+        # Also handle VQA-style patterns
+        for pattern in VQA_PATTERNS:
+            match = re.match(pattern, cleaned, re.IGNORECASE)
+            if match:
+                cleaned = cleaned[match.end():]
+                break
+
+        # Clean up extra whitespace from removals
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        cleaned = cleaned.strip()
+
+        # Capitalize first letter if needed
+        if cleaned and cleaned[0].islower():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+
+        return cleaned
+
     def generate_response(
         self,
         image: Union[str, np.ndarray, torch.Tensor],
         question: str,
         modality: str = "CT",
+        validate_prompt: bool = True,
+        clean_output: bool = True,
     ) -> str:
         """
         Generate a response for a question about an image.
@@ -221,6 +338,8 @@ class Med3DVLMModel(Medical3DModel):
             image: DICOM path, preprocessed array, or tensor
             question: Question to ask about the image
             modality: "CT" or "MRI"
+            validate_prompt: If True, validate prompt format before generation
+            clean_output: If True, clean response to remove artifacts
 
         Returns:
             Model's response string
@@ -231,14 +350,24 @@ class Med3DVLMModel(Medical3DModel):
         image_tensor = self.preprocess_tensor(image, modality)
 
         # Get proj_out_num from model config (number of image tokens)
-        # Default is 256 based on demo.py
+        # Try multiple config locations for robustness
+        proj_out_num = None
         try:
             proj_out_num = self.model.get_model().config.proj_out_num
         except (AttributeError, TypeError):
-            proj_out_num = 256
+            pass
+
+        if proj_out_num is None:
+            try:
+                proj_out_num = self.model.config.proj_out_num
+            except (AttributeError, TypeError):
+                pass
+
+        if proj_out_num is None:
+            proj_out_num = 256  # Default from original Med3DVLM demo.py
 
         # Build prompt with image tokens (same format as M3D-LaMed)
-        # Format: <im_patch> * 256 + question
+        # Format: <im_patch> * proj_out_num + question
         image_tokens = "<im_patch>" * proj_out_num
         prompt = image_tokens + question
 
@@ -251,10 +380,18 @@ class Med3DVLMModel(Medical3DModel):
             max_length=1024,
         ).to(self.device)
 
-        # Generation parameters
+        # Track input length for extracting only new tokens
+        input_len = inputs.input_ids.shape[1]
+
+        # Validate prompt format (catches chat template issues)
+        if validate_prompt:
+            self._validate_prompt_format(inputs.input_ids, proj_out_num)
+
+        # Generation parameters - temperature 1.0 matches original Med3DVLM
+        # (original uses temperature=1.0 in demo.py and app.py)
         generation_kwargs = {
             "max_new_tokens": self.max_new_tokens,
-            "temperature": 0.7,
+            "temperature": 1.0,  # Match original Med3DVLM implementation
             "do_sample": True,
             "top_p": 0.9,
         }
@@ -267,14 +404,22 @@ class Med3DVLMModel(Medical3DModel):
                 **generation_kwargs,
             )
 
-        # Decode response
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # Remove the input question from response if present
-        if question in response:
-            response = response.split(question)[-1]
+        # Extract only new tokens (more reliable than string matching)
+        if outputs.shape[1] > input_len:
+            new_tokens = outputs[0][input_len:]
+            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        else:
+            # Fallback: decode full output
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Remove the input question from response if present
+            if question in response:
+                response = response.split(question)[-1]
 
         response = response.strip()
+
+        # Clean response to remove artifacts (bounding boxes, conversational prefixes)
+        if clean_output:
+            response = self._clean_response(response)
 
         # Check for common error indicators
         if response in ["?", "", "."]:

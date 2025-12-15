@@ -340,13 +340,16 @@ class M3DLaMedModel(Medical3DModel):
         # Suppress segmentation token from text output
         seg_token_id = getattr(self.model.config, 'seg_token_id', self.SEG_TOKEN_ID)
 
+        # Generation parameters
+        # Note on temperature: Original M3D-LaMed demos use varying temperatures (0.7-1.0).
+        # We use 0.7 for slightly more focused outputs. For Med3DVLM, use 1.0 to match original.
         with torch.no_grad():
             result = self.model.generate(
                 image_tensor,
                 input_ids,
                 seg_enable=False,
                 do_sample=True,
-                temperature=0.7,
+                temperature=0.7,  # Slightly lower than default for more focused outputs
                 top_p=0.9,
                 max_new_tokens=self.max_new_tokens,
                 bad_words_ids=[[seg_token_id]],
