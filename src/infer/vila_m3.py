@@ -157,20 +157,32 @@ class VILAm3Model(Medical3DModel):
             "Pass image paths directly to generate_response()."
         )
 
-    def _convert_dicom_to_nifti(self, dicom_path: str) -> str:
+    def _convert_dicom_to_slice_image(
+        self,
+        dicom_path: str,
+        modality: str = "CT",
+        slice_index: Optional[int] = None,
+    ) -> str:
         """
-        Convert DICOM series to NIfTI format for VILA-M3.
+        Convert DICOM series to a 2D slice image (JPG) for VILA-M3.
+
+        VILA-M3 uses PIL for image loading, which only supports 2D formats.
+        This method extracts a representative slice from the DICOM volume,
+        applies appropriate windowing, and saves as JPG.
 
         Args:
             dicom_path: Path to DICOM series directory
+            modality: "CT" or "MRI" for appropriate windowing
+            slice_index: Specific slice to extract (None = middle slice)
 
         Returns:
-            Path to converted NIfTI file
+            Path to JPG slice image
         """
         try:
             import SimpleITK as sitk
+            from PIL import Image as PILImage
         except ImportError:
-            raise ImportError("SimpleITK required for DICOM conversion")
+            raise ImportError("SimpleITK and Pillow required for DICOM conversion")
 
         if self._temp_dir is None:
             self._temp_dir = tempfile.mkdtemp(prefix="vila_m3_")
@@ -185,11 +197,55 @@ class VILAm3Model(Medical3DModel):
         reader.SetFileNames(dicom_files)
         image = reader.Execute()
 
-        # Save as NIfTI
-        nifti_path = os.path.join(self._temp_dir, "volume.nii.gz")
-        sitk.WriteImage(image, nifti_path)
+        # Get array (SimpleITK uses [Z, Y, X] ordering)
+        array = sitk.GetArrayFromImage(image).astype(np.float32)
 
-        return nifti_path
+        # Select slice (middle by default)
+        num_slices = array.shape[0]
+        if slice_index is None:
+            slice_index = num_slices // 2
+        slice_index = max(0, min(slice_index, num_slices - 1))
+
+        slice_2d = array[slice_index, :, :]
+
+        # Apply windowing based on modality
+        if modality.upper() == "CT":
+            # Soft tissue window (WL=50, WW=400) - matches VILA-M3's utils.py
+            window_center = 50
+            window_width = 400
+            min_val = window_center - window_width / 2
+            max_val = window_center + window_width / 2
+            slice_2d = np.clip(slice_2d, min_val, max_val)
+            slice_2d = ((slice_2d - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        elif modality.upper() == "MRI":
+            # Percentile-based scaling for MRI
+            p2, p98 = np.percentile(slice_2d, (2, 98))
+            slice_2d = np.clip(slice_2d, p2, p98)
+            if p98 > p2:
+                slice_2d = ((slice_2d - p2) / (p98 - p2) * 255).astype(np.uint8)
+            else:
+                slice_2d = np.zeros_like(slice_2d, dtype=np.uint8)
+        else:
+            # Generic min-max scaling
+            min_val, max_val = slice_2d.min(), slice_2d.max()
+            if max_val > min_val:
+                slice_2d = ((slice_2d - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            else:
+                slice_2d = np.zeros_like(slice_2d, dtype=np.uint8)
+
+        # Rotate to match standard viewing orientation (RAS)
+        slice_2d = np.rot90(slice_2d, k=1)
+        slice_2d = np.flipud(slice_2d)
+
+        # Convert to RGB (PIL expects RGB for .jpg)
+        rgb_slice = np.stack([slice_2d, slice_2d, slice_2d], axis=-1)
+
+        # Save as JPG
+        jpg_path = os.path.join(self._temp_dir, f"slice_{slice_index}.jpg")
+        pil_image = PILImage.fromarray(rgb_slice, mode='RGB')
+        pil_image.save(jpg_path, quality=95)
+
+        return jpg_path
 
     def load_model(self) -> None:
         """Load VILA-M3 model and framework."""
@@ -262,53 +318,162 @@ class VILAm3Model(Medical3DModel):
 
         print("VILA-M3 model unloaded.")
 
-    def _prepare_image(self, image: Union[str, np.ndarray, torch.Tensor], modality: str) -> str:
+    def _prepare_image(
+        self,
+        image: Union[str, np.ndarray, torch.Tensor],
+        modality: str,
+        slice_index: Optional[int] = None,
+    ) -> str:
         """
         Prepare image for VILA-M3 processing.
 
+        VILA-M3 uses PIL for loading images, so we convert everything to
+        2D JPG/PNG format. For 3D volumes (DICOM or arrays), we extract
+        a representative slice.
+
         Args:
             image: DICOM path, image path, or array
-            modality: CT or MRI
+            modality: CT or MRI (for windowing)
+            slice_index: Specific slice to extract from 3D volumes
 
         Returns:
-            Path to image file (.nii.gz for 3D, .jpg/.png for 2D)
+            Path to 2D image file (.jpg/.png)
         """
         if isinstance(image, str):
             path = Path(image)
 
             # Check if it's a DICOM directory
             if path.is_dir():
-                # Convert DICOM to NIfTI
-                return self._convert_dicom_to_nifti(image)
+                # Convert DICOM to 2D slice image (JPG)
+                return self._convert_dicom_to_slice_image(image, modality, slice_index)
 
-            # Check if it's already a supported file
-            if path.suffix.lower() in ['.nii', '.gz', '.jpg', '.jpeg', '.png']:
+            # Check if it's already a 2D image
+            if path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']:
                 return str(path)
+
+            # NIfTI files need slice extraction
+            if path.suffix.lower() in ['.nii', '.gz']:
+                return self._convert_nifti_to_slice_image(str(path), modality, slice_index)
 
             raise ValueError(f"Unsupported image path: {image}")
 
         elif isinstance(image, (np.ndarray, torch.Tensor)):
-            # Save array as NIfTI
-            if self._temp_dir is None:
-                self._temp_dir = tempfile.mkdtemp(prefix="vila_m3_")
-
-            if isinstance(image, torch.Tensor):
-                image = image.cpu().numpy()
-
-            # Remove batch/channel dims if present
-            while image.ndim > 3:
-                image = image[0]
-
-            try:
-                import SimpleITK as sitk
-                sitk_image = sitk.GetImageFromArray(image)
-                nifti_path = os.path.join(self._temp_dir, "volume.nii.gz")
-                sitk.WriteImage(sitk_image, nifti_path)
-                return nifti_path
-            except ImportError:
-                raise ImportError("SimpleITK required for array processing")
+            # Convert array to 2D slice image
+            return self._convert_array_to_slice_image(image, modality, slice_index)
 
         raise ValueError(f"Unsupported image type: {type(image)}")
+
+    def _convert_nifti_to_slice_image(
+        self,
+        nifti_path: str,
+        modality: str = "CT",
+        slice_index: Optional[int] = None,
+    ) -> str:
+        """Convert NIfTI file to a 2D slice image (JPG)."""
+        try:
+            import nibabel as nib
+            from PIL import Image as PILImage
+        except ImportError:
+            raise ImportError("nibabel and Pillow required for NIfTI conversion")
+
+        if self._temp_dir is None:
+            self._temp_dir = tempfile.mkdtemp(prefix="vila_m3_")
+
+        # Load NIfTI
+        nii = nib.load(nifti_path)
+        array = nii.get_fdata().astype(np.float32)
+
+        # Select slice (middle by default)
+        num_slices = array.shape[2]  # nibabel uses [X, Y, Z]
+        if slice_index is None:
+            slice_index = num_slices // 2
+        slice_index = max(0, min(slice_index, num_slices - 1))
+
+        slice_2d = array[:, :, slice_index]
+
+        # Apply windowing (same as DICOM conversion)
+        slice_2d = self._apply_windowing(slice_2d, modality)
+
+        # Rotate to match viewing orientation
+        slice_2d = np.rot90(slice_2d, k=1)
+
+        # Convert to RGB
+        rgb_slice = np.stack([slice_2d, slice_2d, slice_2d], axis=-1)
+
+        # Save as JPG
+        jpg_path = os.path.join(self._temp_dir, f"nifti_slice_{slice_index}.jpg")
+        pil_image = PILImage.fromarray(rgb_slice, mode='RGB')
+        pil_image.save(jpg_path, quality=95)
+
+        return jpg_path
+
+    def _convert_array_to_slice_image(
+        self,
+        array: Union[np.ndarray, torch.Tensor],
+        modality: str = "CT",
+        slice_index: Optional[int] = None,
+    ) -> str:
+        """Convert numpy/torch array to a 2D slice image (JPG)."""
+        from PIL import Image as PILImage
+
+        if self._temp_dir is None:
+            self._temp_dir = tempfile.mkdtemp(prefix="vila_m3_")
+
+        if isinstance(array, torch.Tensor):
+            array = array.cpu().numpy()
+
+        # Remove batch/channel dims if present
+        while array.ndim > 3:
+            array = array[0]
+
+        array = array.astype(np.float32)
+
+        # Select slice if 3D
+        if array.ndim == 3:
+            num_slices = array.shape[0]  # Assuming [Z, Y, X] or [D, H, W]
+            if slice_index is None:
+                slice_index = num_slices // 2
+            slice_index = max(0, min(slice_index, num_slices - 1))
+            slice_2d = array[slice_index, :, :]
+        else:
+            slice_2d = array
+
+        # Apply windowing
+        slice_2d = self._apply_windowing(slice_2d, modality)
+
+        # Convert to RGB
+        rgb_slice = np.stack([slice_2d, slice_2d, slice_2d], axis=-1)
+
+        # Save as JPG
+        jpg_path = os.path.join(self._temp_dir, f"array_slice.jpg")
+        pil_image = PILImage.fromarray(rgb_slice, mode='RGB')
+        pil_image.save(jpg_path, quality=95)
+
+        return jpg_path
+
+    def _apply_windowing(self, slice_2d: np.ndarray, modality: str) -> np.ndarray:
+        """Apply appropriate windowing based on modality."""
+        if modality.upper() == "CT":
+            # Soft tissue window (WL=50, WW=400)
+            window_center = 50
+            window_width = 400
+            min_val = window_center - window_width / 2
+            max_val = window_center + window_width / 2
+            slice_2d = np.clip(slice_2d, min_val, max_val)
+            return ((slice_2d - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+        elif modality.upper() == "MRI":
+            # Percentile-based scaling for MRI
+            p2, p98 = np.percentile(slice_2d, (2, 98))
+            slice_2d = np.clip(slice_2d, p2, p98)
+            if p98 > p2:
+                return ((slice_2d - p2) / (p98 - p2) * 255).astype(np.uint8)
+            return np.zeros_like(slice_2d, dtype=np.uint8)
+        else:
+            # Generic min-max scaling
+            min_val, max_val = slice_2d.min(), slice_2d.max()
+            if max_val > min_val:
+                return ((slice_2d - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            return np.zeros_like(slice_2d, dtype=np.uint8)
 
     def _clean_response(self, response: str, modality: str = "CT") -> str:
         """
@@ -373,8 +538,8 @@ class VILAm3Model(Medical3DModel):
         """
         self.ensure_loaded()
 
-        # Prepare image
-        image_path = self._prepare_image(image, modality)
+        # Prepare image (converts to 2D JPG slice for PIL compatibility)
+        image_path = self._prepare_image(image, modality, slice_index)
 
         # Include modality context in the question to reduce confusion
         modality_context = f"This is a {modality} scan. "

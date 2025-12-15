@@ -337,18 +337,47 @@ def capture_vila_m3_debug(
             image_path = f"{temp_dir}/synthetic.nii.gz"
             sitk.WriteImage(sitk_image, image_path)
         else:
-            # Convert DICOM to NIfTI
+            # Convert DICOM to 2D JPG slice (VILA-M3 uses PIL which can't read NIfTI)
             import SimpleITK as sitk
             import tempfile
+            from PIL import Image as PILImage
 
             reader = sitk.ImageSeriesReader()
             dicom_files = reader.GetGDCMSeriesFileNames(dicom_path)
             reader.SetFileNames(dicom_files)
             image = reader.Execute()
 
+            # Get array and extract middle slice
+            array = sitk.GetArrayFromImage(image).astype(np.float32)
+            num_slices = array.shape[0]
+            slice_idx = num_slices // 2
+            slice_2d = array[slice_idx, :, :]
+
+            # Apply CT soft tissue windowing (WL=50, WW=400)
+            window_center = 50
+            window_width = 400
+            min_val = window_center - window_width / 2
+            max_val = window_center + window_width / 2
+            slice_2d = np.clip(slice_2d, min_val, max_val)
+            slice_2d = ((slice_2d - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+
+            # Rotate and convert to RGB
+            slice_2d = np.rot90(slice_2d, k=1)
+            slice_2d = np.flipud(slice_2d)
+            rgb_slice = np.stack([slice_2d, slice_2d, slice_2d], axis=-1)
+
+            # Save as JPG
             temp_dir = tempfile.mkdtemp()
-            image_path = f"{temp_dir}/volume.nii.gz"
-            sitk.WriteImage(image, image_path)
+            image_path = f"{temp_dir}/slice_{slice_idx}.jpg"
+            pil_image = PILImage.fromarray(rgb_slice, mode='RGB')
+            pil_image.save(image_path, quality=95)
+
+            result["debug_data"]["slice_extraction"] = {
+                "total_slices": num_slices,
+                "selected_slice": slice_idx,
+                "slice_shape": list(slice_2d.shape),
+                "image_path": image_path,
+            }
 
         messages = [
             {
