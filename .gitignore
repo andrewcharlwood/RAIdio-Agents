@@ -141,3 +141,4 @@ tmp/
 CLAUDE.md
 *.md
 Cloud Output/
+debug*.json
